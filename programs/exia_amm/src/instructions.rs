@@ -87,3 +87,37 @@ pub struct AddLiquidity<'info> {
     pub token_program: Program<'info, Token>,
     pub system_program: Program<'info, System>,
 }
+#[derive(Accounts)]
+pub struct Swap<'info> {
+    #[account(mut)]
+    pub user: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [b"pool", pool_state.token_a_mint.as_ref(), pool_state.token_b_mint.as_ref()],
+        bump = pool_state.pool_bump
+    )]
+    pub pool_state: Box<Account<'info, PoolState>>,
+
+    // User's source and destination token accounts (direction determined by a_to_b flag)
+    #[account(mut)]
+    pub user_token_in: Account<'info, TokenAccount>,
+    #[account(mut)]
+    pub user_token_out: Account<'info, TokenAccount>,
+
+    // Vaults — both needed regardless of direction
+    #[account(mut, address = pool_state.token_a_vault)]
+    pub vault_a: Box<Account<'info, TokenAccount>>,
+    #[account(mut, address = pool_state.token_b_vault)]
+    pub vault_b: Box<Account<'info, TokenAccount>>,
+
+    /// CHECK: This is the treasury wallet stored in pool_state.
+    /// We verify its address via the constraint below.
+    #[account(
+        mut,
+        address = pool_state.treasury_wallet
+    )]
+    pub treasury_token_in: Account<'info, TokenAccount>,
+
+    pub token_program: Program<'info, Token>,
+}
