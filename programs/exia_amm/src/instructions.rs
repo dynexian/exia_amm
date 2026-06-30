@@ -7,23 +7,54 @@ pub struct InitializePool<'info> {
     pub payer: Signer<'info>,
 
     #[account(
-        init, 
-        payer = payer, 
+        init,
+        payer = payer,
         space = PoolState::MAX_SPACE,
         seeds = [b"pool", token_a_mint.key().as_ref(), token_b_mint.key().as_ref()],
         bump
     )]
     pub pool_state: Box<Account<'info, PoolState>>,
 
-    /// CHECK: This is a Mint account. We only need its public key to derive the PDA seeds.
-    /// The program logic does not read or write data from this account, so no type check is required.
-    pub token_a_mint: UncheckedAccount<'info>,
+    // Upgraded to actual Mint types so Anchor can validate them
+    pub token_a_mint: Account<'info, Mint>,
+    pub token_b_mint: Account<'info, Mint>,
 
-    /// CHECK: This is a Mint account. We only need its public key to derive the PDA seeds.
-    /// The program logic does not read or write data from this account, so no type check is required.
-    pub token_b_mint: UncheckedAccount<'info>,
+    // --- PROTOCOL SOVEREIGNTY: Auto-creating the Vaults and LP Mint ---
 
+    #[account(
+        init,
+        payer = payer,
+        token::mint = token_a_mint,
+        token::authority = pool_state, // The PDA owns this vault
+        seeds = [b"vault_a", pool_state.key().as_ref()],
+        bump,
+    )]
+    pub vault_a: Box<Account<'info, TokenAccount>>,
+
+    #[account(
+        init,
+        payer = payer,
+        token::mint = token_b_mint,
+        token::authority = pool_state,
+        seeds = [b"vault_b", pool_state.key().as_ref()],
+        bump,
+    )]
+    pub vault_b: Box<Account<'info, TokenAccount>>,
+
+    #[account(
+        init,
+        payer = payer,
+        mint::decimals = 9,
+        mint::authority = pool_state, // The PDA controls the LP printing press
+        seeds = [b"lp_mint", pool_state.key().as_ref()],
+        bump,
+    )]
+    pub lp_mint: Box<Account<'info, Mint>>,
+
+    // Necessary programs for creating token accounts
     pub system_program: Program<'info, System>,
+    pub token_program: Program<'info, Token>,
+    pub rent: Sysvar<'info, Rent>,
 }
 
 #[derive(Accounts)]

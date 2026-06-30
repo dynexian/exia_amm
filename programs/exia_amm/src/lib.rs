@@ -23,7 +23,14 @@ pub mod exia_amm {
 
         pool_state.token_a_mint = ctx.accounts.token_a_mint.key();
         pool_state.token_b_mint = ctx.accounts.token_b_mint.key();
+
+        pool_state.token_a_vault = ctx.accounts.vault_a.key();
+        pool_state.token_b_vault = ctx.accounts.vault_b.key();
+        pool_state.lp_mint = ctx.accounts.lp_mint.key();
+
         pool_state.pool_bump = ctx.bumps.pool_state;
+        // The pool_state PDA is its own authority, so we save its bump for signing later
+        pool_state.authority_bump = ctx.bumps.pool_state;
 
         pool_state.lp_fee_bps = lp_fee_bps;
         pool_state.protocol_fee_bps = protocol_fee_bps;
