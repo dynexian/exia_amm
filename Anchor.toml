@@ -7,7 +7,7 @@ resolution = true
 skip-lint = false
 
 [programs.localnet]
-exia_amm = "H8au3sdKDsZCaHsJMFTdQdPjHdD26XRaxAabMndWPZFM"
+exia_amm = "2Hy7ouFwJLkG7cpAoSR4hGaFk3zPH2gAYLKjTMdGsqQs"
 
 [provider]
 cluster = "localnet"
