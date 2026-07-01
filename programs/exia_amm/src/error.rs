@@ -16,4 +16,10 @@ pub enum ErrorCode {
     Unauthorized,
     #[msg("Fee exceeds maximum allowed (500 bps)")]
     FeeTooHigh,
+    #[msg("Amount must be greater than zero")]
+    InvalidAmount,
+    #[msg("Token account does not match the pool direction or mint")]
+    InvalidTokenAccount,
+    #[msg("Treasury token account does not match the pool direction")]
+    InvalidTreasury,
 }

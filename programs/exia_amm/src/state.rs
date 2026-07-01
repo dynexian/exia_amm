@@ -16,11 +16,12 @@ pub struct PoolState {
     // --- Fees Configuration ---
     pub lp_fee_bps: u16,
     pub protocol_fee_bps: u16,
-    pub treasury_wallet: Pubkey,
+    pub treasury_token_a: Pubkey,
+    pub treasury_token_b: Pubkey,
 
     // --- Admin ---
     pub authority: Pubkey,
-    pub pending_authority: Pubkey,  // zero pubkey = no pending transfer
+    pub pending_authority: Pubkey, // zero pubkey = no pending transfer
     pub is_paused: bool,
 
     // --- Math & Invariant Tracking ---
@@ -33,7 +34,6 @@ pub struct PoolState {
 }
 
 impl PoolState {
-    // 8 + 32*7 + 1*2 + 2*2 + 1 + 16*3 + 8
-    // 8 + 32*8 + 1*2 + 2*2 + 1 + 16*3 + 8
-    pub const MAX_SPACE: usize = 327;
+    // 8 discriminator + 9 pubkeys + 2 u8 + 2 u16 + bool + 3 u128 + u64
+    pub const MAX_SPACE: usize = 359;
 }

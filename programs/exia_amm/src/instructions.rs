@@ -1,6 +1,6 @@
-use anchor_lang::prelude::*;
 use crate::state::PoolState;
-use anchor_spl::token::{Token, TokenAccount, Mint};
+use anchor_lang::prelude::*;
+use anchor_spl::token::{Mint, Token, TokenAccount};
 #[derive(Accounts)]
 pub struct InitializePool<'info> {
     #[account(mut)]
@@ -19,8 +19,12 @@ pub struct InitializePool<'info> {
     pub token_a_mint: Account<'info, Mint>,
     pub token_b_mint: Account<'info, Mint>,
 
-    // --- PROTOCOL SOVEREIGNTY: Auto-creating the Vaults and LP Mint ---
+    #[account(constraint = treasury_token_a.mint == token_a_mint.key())]
+    pub treasury_token_a: Account<'info, TokenAccount>,
+    #[account(constraint = treasury_token_b.mint == token_b_mint.key())]
+    pub treasury_token_b: Account<'info, TokenAccount>,
 
+    // --- PROTOCOL SOVEREIGNTY: Auto-creating the Vaults and LP Mint ---
     #[account(
         init,
         payer = payer,
@@ -111,12 +115,7 @@ pub struct Swap<'info> {
     #[account(mut, address = pool_state.token_b_vault)]
     pub vault_b: Box<Account<'info, TokenAccount>>,
 
-    /// CHECK: This is the treasury wallet stored in pool_state.
-    /// We verify its address via the constraint below.
-    #[account(
-        mut,
-        address = pool_state.treasury_wallet
-    )]
+    #[account(mut)]
     pub treasury_token_in: Account<'info, TokenAccount>,
 
     pub token_program: Program<'info, Token>,
@@ -191,8 +190,10 @@ pub struct RotateTreasury<'info> {
     )]
     pub pool_state: Box<Account<'info, PoolState>>,
 
-    /// CHECK: New treasury wallet — validated by caller, stored as pubkey only.
-    pub new_treasury: UncheckedAccount<'info>,
+    #[account(constraint = new_treasury_token_a.mint == pool_state.token_a_mint)]
+    pub new_treasury_token_a: Account<'info, TokenAccount>,
+    #[account(constraint = new_treasury_token_b.mint == pool_state.token_b_mint)]
+    pub new_treasury_token_b: Account<'info, TokenAccount>,
 }
 
 #[derive(Accounts)]

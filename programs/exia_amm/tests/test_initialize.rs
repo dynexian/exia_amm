@@ -2,10 +2,7 @@ use {
     anchor_lang::{
         prelude::Pubkey,
         solana_program::{
-            instruction::Instruction,
-            system_instruction,
-            system_program,
-            rent::Rent,
+            instruction::Instruction, rent::Rent, system_instruction, system_program,
         },
         AccountDeserialize, InstructionData, ToAccountMetas,
     },
@@ -23,6 +20,150 @@ fn send_tx(svm: &mut LiteSVM, payer: &Keypair, ixs: Vec<Instruction>, signers: &
     svm.send_transaction(tx).expect("Transaction failed");
 }
 
+fn tx_succeeds(
+    svm: &mut LiteSVM,
+    payer: &Keypair,
+    ixs: Vec<Instruction>,
+    signers: &[&Keypair],
+) -> bool {
+    let blockhash = svm.latest_blockhash();
+    let msg = Message::new_with_blockhash(&ixs, Some(&payer.pubkey()), &blockhash);
+    let tx = VersionedTransaction::try_new(VersionedMessage::Legacy(msg), signers).unwrap();
+    svm.send_transaction(tx).is_ok()
+}
+
+fn token_amount(svm: &LiteSVM, token_account: &Pubkey) -> u64 {
+    let data = svm.get_account(token_account).unwrap().data;
+    let token_state =
+        anchor_spl::token::TokenAccount::try_deserialize(&mut data.as_slice()).unwrap();
+    token_state.amount
+}
+
+fn pool_state(svm: &LiteSVM, pool_state_pda: &Pubkey) -> exia_amm::state::PoolState {
+    let data = svm.get_account(pool_state_pda).unwrap().data;
+    exia_amm::state::PoolState::try_deserialize(&mut data.as_slice()).unwrap()
+}
+
+fn create_token_account(
+    svm: &mut LiteSVM,
+    payer: &Keypair,
+    mint: &Pubkey,
+    owner: &Pubkey,
+) -> Keypair {
+    let token_account = Keypair::new();
+    let token_account_space = anchor_spl::token::TokenAccount::LEN as u64;
+    let token_account_rent = Rent::default().minimum_balance(token_account_space as usize);
+
+    send_tx(
+        svm,
+        payer,
+        vec![
+            system_instruction::create_account(
+                &payer.pubkey(),
+                &token_account.pubkey(),
+                token_account_rent,
+                token_account_space,
+                &anchor_spl::token::ID,
+            ),
+            anchor_spl::token::spl_token::instruction::initialize_account(
+                &anchor_spl::token::ID,
+                &token_account.pubkey(),
+                mint,
+                owner,
+            )
+            .unwrap(),
+        ],
+        &[payer, &token_account],
+    );
+
+    token_account
+}
+
+fn mint_to_account(
+    svm: &mut LiteSVM,
+    payer: &Keypair,
+    mint: &Pubkey,
+    token_account: &Pubkey,
+    amount: u64,
+) {
+    send_tx(
+        svm,
+        payer,
+        vec![anchor_spl::token::spl_token::instruction::mint_to(
+            &anchor_spl::token::ID,
+            mint,
+            token_account,
+            &payer.pubkey(),
+            &[],
+            amount,
+        )
+        .unwrap()],
+        &[payer],
+    );
+}
+
+fn add_fixture_liquidity(
+    f: &mut PoolFixture,
+    amount_a: u64,
+    amount_b: u64,
+) -> (Keypair, Keypair, Keypair, u64) {
+    let payer = f.payer.insecure_clone();
+    let user_token_a = create_token_account(
+        &mut f.svm,
+        &payer,
+        &f.token_a_mint.pubkey(),
+        &payer.pubkey(),
+    );
+    let user_token_b = create_token_account(
+        &mut f.svm,
+        &payer,
+        &f.token_b_mint.pubkey(),
+        &payer.pubkey(),
+    );
+    let user_lp_token = create_token_account(&mut f.svm, &payer, &f.lp_mint_pda, &payer.pubkey());
+
+    mint_to_account(
+        &mut f.svm,
+        &payer,
+        &f.token_a_mint.pubkey(),
+        &user_token_a.pubkey(),
+        amount_a,
+    );
+    mint_to_account(
+        &mut f.svm,
+        &payer,
+        &f.token_b_mint.pubkey(),
+        &user_token_b.pubkey(),
+        amount_b,
+    );
+
+    send_tx(
+        &mut f.svm,
+        &payer,
+        vec![Instruction::new_with_bytes(
+            exia_amm::id(),
+            &exia_amm::instruction::AddLiquidity { amount_a, amount_b }.data(),
+            exia_amm::accounts::AddLiquidity {
+                user: payer.pubkey(),
+                pool_state: f.pool_state_pda,
+                user_token_a: user_token_a.pubkey(),
+                user_token_b: user_token_b.pubkey(),
+                user_lp_token: user_lp_token.pubkey(),
+                vault_a: f.vault_a_pda,
+                vault_b: f.vault_b_pda,
+                lp_mint: f.lp_mint_pda,
+                token_program: anchor_spl::token::ID,
+                system_program: system_program::ID,
+            }
+            .to_account_metas(None),
+        )],
+        &[&payer],
+    );
+
+    let lp_amount = token_amount(&f.svm, &user_lp_token.pubkey());
+    (user_token_a, user_token_b, user_lp_token, lp_amount)
+}
+
 struct PoolFixture {
     svm: LiteSVM,
     payer: Keypair,
@@ -32,6 +173,8 @@ struct PoolFixture {
     vault_a_pda: Pubkey,
     vault_b_pda: Pubkey,
     lp_mint_pda: Pubkey,
+    treasury_token_a: Keypair,
+    treasury_token_b: Keypair,
 }
 
 fn setup_initialized_pool() -> PoolFixture {
@@ -39,55 +182,153 @@ fn setup_initialized_pool() -> PoolFixture {
     let payer = Keypair::new();
     let token_a_mint = Keypair::new();
     let token_b_mint = Keypair::new();
+    let treasury_token_a = Keypair::new();
+    let treasury_token_b = Keypair::new();
 
     let (pool_state_pda, _) = Pubkey::find_program_address(
-        &[b"pool", token_a_mint.pubkey().as_ref(), token_b_mint.pubkey().as_ref()],
+        &[
+            b"pool",
+            token_a_mint.pubkey().as_ref(),
+            token_b_mint.pubkey().as_ref(),
+        ],
         &program_id,
     );
-    let (vault_a_pda, _) = Pubkey::find_program_address(&[b"vault_a", pool_state_pda.as_ref()], &program_id);
-    let (vault_b_pda, _) = Pubkey::find_program_address(&[b"vault_b", pool_state_pda.as_ref()], &program_id);
-    let (lp_mint_pda, _) = Pubkey::find_program_address(&[b"lp_mint", pool_state_pda.as_ref()], &program_id);
+    let (vault_a_pda, _) =
+        Pubkey::find_program_address(&[b"vault_a", pool_state_pda.as_ref()], &program_id);
+    let (vault_b_pda, _) =
+        Pubkey::find_program_address(&[b"vault_b", pool_state_pda.as_ref()], &program_id);
+    let (lp_mint_pda, _) =
+        Pubkey::find_program_address(&[b"lp_mint", pool_state_pda.as_ref()], &program_id);
 
     let mut svm = LiteSVM::new();
-    let bytes = include_bytes!(concat!(env!("CARGO_TARGET_TMPDIR"), "/../deploy/exia_amm.so"));
+    let bytes = include_bytes!(concat!(
+        env!("CARGO_TARGET_TMPDIR"),
+        "/../deploy/exia_amm.so"
+    ));
     svm.add_program(program_id, bytes).unwrap();
     svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
 
     let mint_space = anchor_spl::token::Mint::LEN as u64;
     let mint_rent = Rent::default().minimum_balance(mint_space as usize);
+    let token_account_space = anchor_spl::token::TokenAccount::LEN as u64;
+    let token_account_rent = Rent::default().minimum_balance(token_account_space as usize);
 
-    send_tx(&mut svm, &payer, vec![
-        system_instruction::create_account(&payer.pubkey(), &token_a_mint.pubkey(), mint_rent, mint_space, &anchor_spl::token::ID),
-        anchor_spl::token::spl_token::instruction::initialize_mint(&anchor_spl::token::ID, &token_a_mint.pubkey(), &payer.pubkey(), None, 6).unwrap(),
-        system_instruction::create_account(&payer.pubkey(), &token_b_mint.pubkey(), mint_rent, mint_space, &anchor_spl::token::ID),
-        anchor_spl::token::spl_token::instruction::initialize_mint(&anchor_spl::token::ID, &token_b_mint.pubkey(), &payer.pubkey(), None, 6).unwrap(),
-    ], &[&payer, &token_a_mint, &token_b_mint]);
+    send_tx(
+        &mut svm,
+        &payer,
+        vec![
+            system_instruction::create_account(
+                &payer.pubkey(),
+                &token_a_mint.pubkey(),
+                mint_rent,
+                mint_space,
+                &anchor_spl::token::ID,
+            ),
+            anchor_spl::token::spl_token::instruction::initialize_mint(
+                &anchor_spl::token::ID,
+                &token_a_mint.pubkey(),
+                &payer.pubkey(),
+                None,
+                6,
+            )
+            .unwrap(),
+            system_instruction::create_account(
+                &payer.pubkey(),
+                &token_b_mint.pubkey(),
+                mint_rent,
+                mint_space,
+                &anchor_spl::token::ID,
+            ),
+            anchor_spl::token::spl_token::instruction::initialize_mint(
+                &anchor_spl::token::ID,
+                &token_b_mint.pubkey(),
+                &payer.pubkey(),
+                None,
+                6,
+            )
+            .unwrap(),
+            system_instruction::create_account(
+                &payer.pubkey(),
+                &treasury_token_a.pubkey(),
+                token_account_rent,
+                token_account_space,
+                &anchor_spl::token::ID,
+            ),
+            anchor_spl::token::spl_token::instruction::initialize_account(
+                &anchor_spl::token::ID,
+                &treasury_token_a.pubkey(),
+                &token_a_mint.pubkey(),
+                &payer.pubkey(),
+            )
+            .unwrap(),
+            system_instruction::create_account(
+                &payer.pubkey(),
+                &treasury_token_b.pubkey(),
+                token_account_rent,
+                token_account_space,
+                &anchor_spl::token::ID,
+            ),
+            anchor_spl::token::spl_token::instruction::initialize_account(
+                &anchor_spl::token::ID,
+                &treasury_token_b.pubkey(),
+                &token_b_mint.pubkey(),
+                &payer.pubkey(),
+            )
+            .unwrap(),
+        ],
+        &[
+            &payer,
+            &token_a_mint,
+            &token_b_mint,
+            &treasury_token_a,
+            &treasury_token_b,
+        ],
+    );
 
-    send_tx(&mut svm, &payer, vec![
-        Instruction::new_with_bytes(
+    send_tx(
+        &mut svm,
+        &payer,
+        vec![Instruction::new_with_bytes(
             program_id,
             &exia_amm::instruction::InitializePool {
                 lp_fee_bps: 25,
                 protocol_fee_bps: 5,
-                treasury_wallet: payer.pubkey(),
                 authority: payer.pubkey(),
-            }.data(),
+            }
+            .data(),
             exia_amm::accounts::InitializePool {
                 payer: payer.pubkey(),
                 pool_state: pool_state_pda,
                 token_a_mint: token_a_mint.pubkey(),
                 token_b_mint: token_b_mint.pubkey(),
+                treasury_token_a: treasury_token_a.pubkey(),
+                treasury_token_b: treasury_token_b.pubkey(),
                 vault_a: vault_a_pda,
                 vault_b: vault_b_pda,
                 lp_mint: lp_mint_pda,
                 token_program: anchor_spl::token::ID,
                 system_program: system_program::ID,
-                rent: "SysvarRent111111111111111111111111111111111".parse().unwrap(),
-            }.to_account_metas(None),
-        )
-    ], &[&payer]);
+                rent: "SysvarRent111111111111111111111111111111111"
+                    .parse()
+                    .unwrap(),
+            }
+            .to_account_metas(None),
+        )],
+        &[&payer],
+    );
 
-    PoolFixture { svm, payer, token_a_mint, token_b_mint, pool_state_pda, vault_a_pda, vault_b_pda, lp_mint_pda }
+    PoolFixture {
+        svm,
+        payer,
+        token_a_mint,
+        token_b_mint,
+        pool_state_pda,
+        vault_a_pda,
+        vault_b_pda,
+        lp_mint_pda,
+        treasury_token_a,
+        treasury_token_b,
+    }
 }
 
 #[test]
@@ -105,6 +346,8 @@ fn test_initialize_pool() {
     assert_eq!(pool_state.lp_mint, f.lp_mint_pda);
     assert_eq!(pool_state.lp_fee_bps, 25);
     assert_eq!(pool_state.protocol_fee_bps, 5);
+    assert_eq!(pool_state.treasury_token_a, f.treasury_token_a.pubkey());
+    assert_eq!(pool_state.treasury_token_b, f.treasury_token_b.pubkey());
     assert_eq!(pool_state.authority, f.payer.pubkey());
     assert_eq!(pool_state.k_last, 0);
 
@@ -123,22 +366,89 @@ fn test_add_liquidity() {
     let user_token_b = Keypair::new();
     let user_lp_token = Keypair::new();
 
-    send_tx(&mut f.svm, &f.payer, vec![
-        system_instruction::create_account(&f.payer.pubkey(), &user_token_a.pubkey(), token_account_rent, token_account_space, &anchor_spl::token::ID),
-        anchor_spl::token::spl_token::instruction::initialize_account(&anchor_spl::token::ID, &user_token_a.pubkey(), &f.token_a_mint.pubkey(), &f.payer.pubkey()).unwrap(),
-        system_instruction::create_account(&f.payer.pubkey(), &user_token_b.pubkey(), token_account_rent, token_account_space, &anchor_spl::token::ID),
-        anchor_spl::token::spl_token::instruction::initialize_account(&anchor_spl::token::ID, &user_token_b.pubkey(), &f.token_b_mint.pubkey(), &f.payer.pubkey()).unwrap(),
-        system_instruction::create_account(&f.payer.pubkey(), &user_lp_token.pubkey(), token_account_rent, token_account_space, &anchor_spl::token::ID),
-        anchor_spl::token::spl_token::instruction::initialize_account(&anchor_spl::token::ID, &user_lp_token.pubkey(), &f.lp_mint_pda, &f.payer.pubkey()).unwrap(),
-    ], &[&f.payer.insecure_clone(), &user_token_a, &user_token_b, &user_lp_token]);
+    send_tx(
+        &mut f.svm,
+        &f.payer,
+        vec![
+            system_instruction::create_account(
+                &f.payer.pubkey(),
+                &user_token_a.pubkey(),
+                token_account_rent,
+                token_account_space,
+                &anchor_spl::token::ID,
+            ),
+            anchor_spl::token::spl_token::instruction::initialize_account(
+                &anchor_spl::token::ID,
+                &user_token_a.pubkey(),
+                &f.token_a_mint.pubkey(),
+                &f.payer.pubkey(),
+            )
+            .unwrap(),
+            system_instruction::create_account(
+                &f.payer.pubkey(),
+                &user_token_b.pubkey(),
+                token_account_rent,
+                token_account_space,
+                &anchor_spl::token::ID,
+            ),
+            anchor_spl::token::spl_token::instruction::initialize_account(
+                &anchor_spl::token::ID,
+                &user_token_b.pubkey(),
+                &f.token_b_mint.pubkey(),
+                &f.payer.pubkey(),
+            )
+            .unwrap(),
+            system_instruction::create_account(
+                &f.payer.pubkey(),
+                &user_lp_token.pubkey(),
+                token_account_rent,
+                token_account_space,
+                &anchor_spl::token::ID,
+            ),
+            anchor_spl::token::spl_token::instruction::initialize_account(
+                &anchor_spl::token::ID,
+                &user_lp_token.pubkey(),
+                &f.lp_mint_pda,
+                &f.payer.pubkey(),
+            )
+            .unwrap(),
+        ],
+        &[
+            &f.payer.insecure_clone(),
+            &user_token_a,
+            &user_token_b,
+            &user_lp_token,
+        ],
+    );
 
     let amount_a: u64 = 10_000_000;
     let amount_b: u64 = 20_000_000;
 
-    send_tx(&mut f.svm, &f.payer, vec![
-        anchor_spl::token::spl_token::instruction::mint_to(&anchor_spl::token::ID, &f.token_a_mint.pubkey(), &user_token_a.pubkey(), &f.payer.pubkey(), &[], amount_a).unwrap(),
-        anchor_spl::token::spl_token::instruction::mint_to(&anchor_spl::token::ID, &f.token_b_mint.pubkey(), &user_token_b.pubkey(), &f.payer.pubkey(), &[], amount_b).unwrap(),
-    ], &[&f.payer.insecure_clone()]);
+    send_tx(
+        &mut f.svm,
+        &f.payer,
+        vec![
+            anchor_spl::token::spl_token::instruction::mint_to(
+                &anchor_spl::token::ID,
+                &f.token_a_mint.pubkey(),
+                &user_token_a.pubkey(),
+                &f.payer.pubkey(),
+                &[],
+                amount_a,
+            )
+            .unwrap(),
+            anchor_spl::token::spl_token::instruction::mint_to(
+                &anchor_spl::token::ID,
+                &f.token_b_mint.pubkey(),
+                &user_token_b.pubkey(),
+                &f.payer.pubkey(),
+                &[],
+                amount_b,
+            )
+            .unwrap(),
+        ],
+        &[&f.payer.insecure_clone()],
+    );
 
     let add_liq_ix = Instruction::new_with_bytes(
         program_id,
@@ -154,32 +464,45 @@ fn test_add_liquidity() {
             lp_mint: f.lp_mint_pda,
             token_program: anchor_spl::token::ID,
             system_program: system_program::ID,
-        }.to_account_metas(None),
+        }
+        .to_account_metas(None),
     );
 
     let blockhash = f.svm.latest_blockhash();
     let msg = Message::new_with_blockhash(&[add_liq_ix], Some(&f.payer.pubkey()), &blockhash);
-    let tx = VersionedTransaction::try_new(VersionedMessage::Legacy(msg), &[&f.payer.insecure_clone()]).unwrap();
+    let tx =
+        VersionedTransaction::try_new(VersionedMessage::Legacy(msg), &[&f.payer.insecure_clone()])
+            .unwrap();
     let res = f.svm.send_transaction(tx);
     assert!(res.is_ok(), "add_liquidity failed: {:?}", res);
 
     let vault_a_data = f.svm.get_account(&f.vault_a_pda).unwrap().data;
-    let vault_a_state = anchor_spl::token::TokenAccount::try_deserialize(&mut vault_a_data.as_slice()).unwrap();
+    let vault_a_state =
+        anchor_spl::token::TokenAccount::try_deserialize(&mut vault_a_data.as_slice()).unwrap();
     assert_eq!(vault_a_state.amount, amount_a);
 
     let vault_b_data = f.svm.get_account(&f.vault_b_pda).unwrap().data;
-    let vault_b_state = anchor_spl::token::TokenAccount::try_deserialize(&mut vault_b_data.as_slice()).unwrap();
+    let vault_b_state =
+        anchor_spl::token::TokenAccount::try_deserialize(&mut vault_b_data.as_slice()).unwrap();
     assert_eq!(vault_b_state.amount, amount_b);
 
     let user_lp_data = f.svm.get_account(&user_lp_token.pubkey()).unwrap().data;
-    let user_lp_state = anchor_spl::token::TokenAccount::try_deserialize(&mut user_lp_data.as_slice()).unwrap();
-    assert!(user_lp_state.amount > 0, "User should have received LP tokens");
+    let user_lp_state =
+        anchor_spl::token::TokenAccount::try_deserialize(&mut user_lp_data.as_slice()).unwrap();
+    assert!(
+        user_lp_state.amount > 0,
+        "User should have received LP tokens"
+    );
 
     let pool_data = f.svm.get_account(&f.pool_state_pda).unwrap().data;
-    let pool_state = exia_amm::state::PoolState::try_deserialize(&mut pool_data.as_slice()).unwrap();
+    let pool_state =
+        exia_amm::state::PoolState::try_deserialize(&mut pool_data.as_slice()).unwrap();
     assert_eq!(pool_state.k_last, amount_a as u128 * amount_b as u128);
 
-    println!("SUCCESS! add_liquidity passed. LP tokens minted: {}", user_lp_state.amount);
+    println!(
+        "SUCCESS! add_liquidity passed. LP tokens minted: {}",
+        user_lp_state.amount
+    );
 }
 
 #[test]
@@ -190,100 +513,234 @@ fn test_swap_a_to_b() {
     let token_account_space = anchor_spl::token::TokenAccount::LEN as u64;
     let token_account_rent = Rent::default().minimum_balance(token_account_space as usize);
 
-    // --- Create treasury token account for Token A (receives protocol fees) ---
-    let treasury_token_a = Keypair::new();
-    send_tx(&mut f.svm, &f.payer, vec![
-        system_instruction::create_account(&f.payer.pubkey(), &treasury_token_a.pubkey(), token_account_rent, token_account_space, &anchor_spl::token::ID),
-        anchor_spl::token::spl_token::instruction::initialize_account(&anchor_spl::token::ID, &treasury_token_a.pubkey(), &f.token_a_mint.pubkey(), &f.payer.pubkey()).unwrap(),
-    ], &[&f.payer.insecure_clone(), &treasury_token_a]);
-
-    // --- Update pool_state.treasury_wallet to point to this token account ---
-    // We need to re-initialize with the correct treasury — for the test we'll
-    // directly patch pool_state via svm.set_account after deserializing,
-    // OR simply re-create the pool with treasury set correctly from the start.
-    // Easiest: create a fresh pool with treasury_token_a as the wallet.
     let payer2 = Keypair::new();
     let token_a_mint2 = Keypair::new();
     let token_b_mint2 = Keypair::new();
     f.svm.airdrop(&payer2.pubkey(), 100_000_000_000).unwrap();
 
     let (pool2_pda, _) = Pubkey::find_program_address(
-        &[b"pool", token_a_mint2.pubkey().as_ref(), token_b_mint2.pubkey().as_ref()],
+        &[
+            b"pool",
+            token_a_mint2.pubkey().as_ref(),
+            token_b_mint2.pubkey().as_ref(),
+        ],
         &program_id,
     );
-    let (vault_a2, _) = Pubkey::find_program_address(&[b"vault_a", pool2_pda.as_ref()], &program_id);
-    let (vault_b2, _) = Pubkey::find_program_address(&[b"vault_b", pool2_pda.as_ref()], &program_id);
-    let (lp_mint2, _) = Pubkey::find_program_address(&[b"lp_mint", pool2_pda.as_ref()], &program_id);
+    let (vault_a2, _) =
+        Pubkey::find_program_address(&[b"vault_a", pool2_pda.as_ref()], &program_id);
+    let (vault_b2, _) =
+        Pubkey::find_program_address(&[b"vault_b", pool2_pda.as_ref()], &program_id);
+    let (lp_mint2, _) =
+        Pubkey::find_program_address(&[b"lp_mint", pool2_pda.as_ref()], &program_id);
 
     let mint_space = anchor_spl::token::Mint::LEN as u64;
     let mint_rent = Rent::default().minimum_balance(mint_space as usize);
 
     // Create mints
-    send_tx(&mut f.svm, &payer2, vec![
-        system_instruction::create_account(&payer2.pubkey(), &token_a_mint2.pubkey(), mint_rent, mint_space, &anchor_spl::token::ID),
-        anchor_spl::token::spl_token::instruction::initialize_mint(&anchor_spl::token::ID, &token_a_mint2.pubkey(), &payer2.pubkey(), None, 6).unwrap(),
-        system_instruction::create_account(&payer2.pubkey(), &token_b_mint2.pubkey(), mint_rent, mint_space, &anchor_spl::token::ID),
-        anchor_spl::token::spl_token::instruction::initialize_mint(&anchor_spl::token::ID, &token_b_mint2.pubkey(), &payer2.pubkey(), None, 6).unwrap(),
-    ], &[&payer2, &token_a_mint2, &token_b_mint2]);
+    send_tx(
+        &mut f.svm,
+        &payer2,
+        vec![
+            system_instruction::create_account(
+                &payer2.pubkey(),
+                &token_a_mint2.pubkey(),
+                mint_rent,
+                mint_space,
+                &anchor_spl::token::ID,
+            ),
+            anchor_spl::token::spl_token::instruction::initialize_mint(
+                &anchor_spl::token::ID,
+                &token_a_mint2.pubkey(),
+                &payer2.pubkey(),
+                None,
+                6,
+            )
+            .unwrap(),
+            system_instruction::create_account(
+                &payer2.pubkey(),
+                &token_b_mint2.pubkey(),
+                mint_rent,
+                mint_space,
+                &anchor_spl::token::ID,
+            ),
+            anchor_spl::token::spl_token::instruction::initialize_mint(
+                &anchor_spl::token::ID,
+                &token_b_mint2.pubkey(),
+                &payer2.pubkey(),
+                None,
+                6,
+            )
+            .unwrap(),
+        ],
+        &[&payer2, &token_a_mint2, &token_b_mint2],
+    );
 
-    // Create treasury token account for this pool's Token A
-    let treasury = Keypair::new();
-    send_tx(&mut f.svm, &payer2, vec![
-        system_instruction::create_account(&payer2.pubkey(), &treasury.pubkey(), token_account_rent, token_account_space, &anchor_spl::token::ID),
-        anchor_spl::token::spl_token::instruction::initialize_account(&anchor_spl::token::ID, &treasury.pubkey(), &token_a_mint2.pubkey(), &payer2.pubkey()).unwrap(),
-    ], &[&payer2, &treasury]);
+    // Create treasury token accounts for this pool
+    let treasury_a = Keypair::new();
+    let treasury_b = Keypair::new();
+    send_tx(
+        &mut f.svm,
+        &payer2,
+        vec![
+            system_instruction::create_account(
+                &payer2.pubkey(),
+                &treasury_a.pubkey(),
+                token_account_rent,
+                token_account_space,
+                &anchor_spl::token::ID,
+            ),
+            anchor_spl::token::spl_token::instruction::initialize_account(
+                &anchor_spl::token::ID,
+                &treasury_a.pubkey(),
+                &token_a_mint2.pubkey(),
+                &payer2.pubkey(),
+            )
+            .unwrap(),
+            system_instruction::create_account(
+                &payer2.pubkey(),
+                &treasury_b.pubkey(),
+                token_account_rent,
+                token_account_space,
+                &anchor_spl::token::ID,
+            ),
+            anchor_spl::token::spl_token::instruction::initialize_account(
+                &anchor_spl::token::ID,
+                &treasury_b.pubkey(),
+                &token_b_mint2.pubkey(),
+                &payer2.pubkey(),
+            )
+            .unwrap(),
+        ],
+        &[&payer2, &treasury_a, &treasury_b],
+    );
 
     // Initialize pool with treasury set
-    send_tx(&mut f.svm, &payer2, vec![
-        Instruction::new_with_bytes(
+    send_tx(
+        &mut f.svm,
+        &payer2,
+        vec![Instruction::new_with_bytes(
             program_id,
             &exia_amm::instruction::InitializePool {
                 lp_fee_bps: 25,
                 protocol_fee_bps: 5,
-                treasury_wallet: treasury.pubkey(),
                 authority: payer2.pubkey(),
-            }.data(),
+            }
+            .data(),
             exia_amm::accounts::InitializePool {
                 payer: payer2.pubkey(),
                 pool_state: pool2_pda,
                 token_a_mint: token_a_mint2.pubkey(),
                 token_b_mint: token_b_mint2.pubkey(),
+                treasury_token_a: treasury_a.pubkey(),
+                treasury_token_b: treasury_b.pubkey(),
                 vault_a: vault_a2,
                 vault_b: vault_b2,
                 lp_mint: lp_mint2,
                 token_program: anchor_spl::token::ID,
                 system_program: system_program::ID,
-                rent: "SysvarRent111111111111111111111111111111111".parse().unwrap(),
-            }.to_account_metas(None),
-        )
-    ], &[&payer2]);
+                rent: "SysvarRent111111111111111111111111111111111"
+                    .parse()
+                    .unwrap(),
+            }
+            .to_account_metas(None),
+        )],
+        &[&payer2],
+    );
 
     // --- Add liquidity so the pool has reserves ---
     let user_token_a = Keypair::new();
     let user_token_b = Keypair::new();
     let user_lp = Keypair::new();
 
-    send_tx(&mut f.svm, &payer2, vec![
-        system_instruction::create_account(&payer2.pubkey(), &user_token_a.pubkey(), token_account_rent, token_account_space, &anchor_spl::token::ID),
-        anchor_spl::token::spl_token::instruction::initialize_account(&anchor_spl::token::ID, &user_token_a.pubkey(), &token_a_mint2.pubkey(), &payer2.pubkey()).unwrap(),
-        system_instruction::create_account(&payer2.pubkey(), &user_token_b.pubkey(), token_account_rent, token_account_space, &anchor_spl::token::ID),
-        anchor_spl::token::spl_token::instruction::initialize_account(&anchor_spl::token::ID, &user_token_b.pubkey(), &token_b_mint2.pubkey(), &payer2.pubkey()).unwrap(),
-        system_instruction::create_account(&payer2.pubkey(), &user_lp.pubkey(), token_account_rent, token_account_space, &anchor_spl::token::ID),
-        anchor_spl::token::spl_token::instruction::initialize_account(&anchor_spl::token::ID, &user_lp.pubkey(), &lp_mint2, &payer2.pubkey()).unwrap(),
-    ], &[&payer2, &user_token_a, &user_token_b, &user_lp]);
+    send_tx(
+        &mut f.svm,
+        &payer2,
+        vec![
+            system_instruction::create_account(
+                &payer2.pubkey(),
+                &user_token_a.pubkey(),
+                token_account_rent,
+                token_account_space,
+                &anchor_spl::token::ID,
+            ),
+            anchor_spl::token::spl_token::instruction::initialize_account(
+                &anchor_spl::token::ID,
+                &user_token_a.pubkey(),
+                &token_a_mint2.pubkey(),
+                &payer2.pubkey(),
+            )
+            .unwrap(),
+            system_instruction::create_account(
+                &payer2.pubkey(),
+                &user_token_b.pubkey(),
+                token_account_rent,
+                token_account_space,
+                &anchor_spl::token::ID,
+            ),
+            anchor_spl::token::spl_token::instruction::initialize_account(
+                &anchor_spl::token::ID,
+                &user_token_b.pubkey(),
+                &token_b_mint2.pubkey(),
+                &payer2.pubkey(),
+            )
+            .unwrap(),
+            system_instruction::create_account(
+                &payer2.pubkey(),
+                &user_lp.pubkey(),
+                token_account_rent,
+                token_account_space,
+                &anchor_spl::token::ID,
+            ),
+            anchor_spl::token::spl_token::instruction::initialize_account(
+                &anchor_spl::token::ID,
+                &user_lp.pubkey(),
+                &lp_mint2,
+                &payer2.pubkey(),
+            )
+            .unwrap(),
+        ],
+        &[&payer2, &user_token_a, &user_token_b, &user_lp],
+    );
 
     let liquidity_a: u64 = 100_000_000; // 100 tokens
     let liquidity_b: u64 = 100_000_000;
 
-    send_tx(&mut f.svm, &payer2, vec![
-        anchor_spl::token::spl_token::instruction::mint_to(&anchor_spl::token::ID, &token_a_mint2.pubkey(), &user_token_a.pubkey(), &payer2.pubkey(), &[], liquidity_a).unwrap(),
-        anchor_spl::token::spl_token::instruction::mint_to(&anchor_spl::token::ID, &token_b_mint2.pubkey(), &user_token_b.pubkey(), &payer2.pubkey(), &[], liquidity_b).unwrap(),
-    ], &[&payer2]);
+    send_tx(
+        &mut f.svm,
+        &payer2,
+        vec![
+            anchor_spl::token::spl_token::instruction::mint_to(
+                &anchor_spl::token::ID,
+                &token_a_mint2.pubkey(),
+                &user_token_a.pubkey(),
+                &payer2.pubkey(),
+                &[],
+                liquidity_a,
+            )
+            .unwrap(),
+            anchor_spl::token::spl_token::instruction::mint_to(
+                &anchor_spl::token::ID,
+                &token_b_mint2.pubkey(),
+                &user_token_b.pubkey(),
+                &payer2.pubkey(),
+                &[],
+                liquidity_b,
+            )
+            .unwrap(),
+        ],
+        &[&payer2],
+    );
 
-    send_tx(&mut f.svm, &payer2, vec![
-        Instruction::new_with_bytes(
+    send_tx(
+        &mut f.svm,
+        &payer2,
+        vec![Instruction::new_with_bytes(
             program_id,
-            &exia_amm::instruction::AddLiquidity { amount_a: liquidity_a, amount_b: liquidity_b }.data(),
+            &exia_amm::instruction::AddLiquidity {
+                amount_a: liquidity_a,
+                amount_b: liquidity_b,
+            }
+            .data(),
             exia_amm::accounts::AddLiquidity {
                 user: payer2.pubkey(),
                 pool_state: pool2_pda,
@@ -295,25 +752,67 @@ fn test_swap_a_to_b() {
                 lp_mint: lp_mint2,
                 token_program: anchor_spl::token::ID,
                 system_program: system_program::ID,
-            }.to_account_metas(None),
-        )
-    ], &[&payer2]);
+            }
+            .to_account_metas(None),
+        )],
+        &[&payer2],
+    );
 
     // --- Setup swapper ---
     let swapper_token_a = Keypair::new();
     let swapper_token_b = Keypair::new();
 
-    send_tx(&mut f.svm, &payer2, vec![
-        system_instruction::create_account(&payer2.pubkey(), &swapper_token_a.pubkey(), token_account_rent, token_account_space, &anchor_spl::token::ID),
-        anchor_spl::token::spl_token::instruction::initialize_account(&anchor_spl::token::ID, &swapper_token_a.pubkey(), &token_a_mint2.pubkey(), &payer2.pubkey()).unwrap(),
-        system_instruction::create_account(&payer2.pubkey(), &swapper_token_b.pubkey(), token_account_rent, token_account_space, &anchor_spl::token::ID),
-        anchor_spl::token::spl_token::instruction::initialize_account(&anchor_spl::token::ID, &swapper_token_b.pubkey(), &token_b_mint2.pubkey(), &payer2.pubkey()).unwrap(),
-    ], &[&payer2, &swapper_token_a, &swapper_token_b]);
+    send_tx(
+        &mut f.svm,
+        &payer2,
+        vec![
+            system_instruction::create_account(
+                &payer2.pubkey(),
+                &swapper_token_a.pubkey(),
+                token_account_rent,
+                token_account_space,
+                &anchor_spl::token::ID,
+            ),
+            anchor_spl::token::spl_token::instruction::initialize_account(
+                &anchor_spl::token::ID,
+                &swapper_token_a.pubkey(),
+                &token_a_mint2.pubkey(),
+                &payer2.pubkey(),
+            )
+            .unwrap(),
+            system_instruction::create_account(
+                &payer2.pubkey(),
+                &swapper_token_b.pubkey(),
+                token_account_rent,
+                token_account_space,
+                &anchor_spl::token::ID,
+            ),
+            anchor_spl::token::spl_token::instruction::initialize_account(
+                &anchor_spl::token::ID,
+                &swapper_token_b.pubkey(),
+                &token_b_mint2.pubkey(),
+                &payer2.pubkey(),
+            )
+            .unwrap(),
+        ],
+        &[&payer2, &swapper_token_a, &swapper_token_b],
+    );
 
     let swap_amount_in: u64 = 1_000_000; // 1 token in
-    send_tx(&mut f.svm, &payer2, vec![
-        anchor_spl::token::spl_token::instruction::mint_to(&anchor_spl::token::ID, &token_a_mint2.pubkey(), &swapper_token_a.pubkey(), &payer2.pubkey(), &[], swap_amount_in).unwrap(),
-    ], &[&payer2]);
+    send_tx(
+        &mut f.svm,
+        &payer2,
+        vec![anchor_spl::token::spl_token::instruction::mint_to(
+            &anchor_spl::token::ID,
+            &token_a_mint2.pubkey(),
+            &swapper_token_a.pubkey(),
+            &payer2.pubkey(),
+            &[],
+            swap_amount_in,
+        )
+        .unwrap()],
+        &[&payer2],
+    );
 
     // --- Execute swap A → B ---
     let swap_ix = Instruction::new_with_bytes(
@@ -322,7 +821,8 @@ fn test_swap_a_to_b() {
             amount_in: swap_amount_in,
             minimum_amount_out: 1,
             a_to_b: true,
-        }.data(),
+        }
+        .data(),
         exia_amm::accounts::Swap {
             user: payer2.pubkey(),
             pool_state: pool2_pda,
@@ -330,9 +830,10 @@ fn test_swap_a_to_b() {
             user_token_out: swapper_token_b.pubkey(),
             vault_a: vault_a2,
             vault_b: vault_b2,
-            treasury_token_in: treasury.pubkey(),
+            treasury_token_in: treasury_a.pubkey(),
             token_program: anchor_spl::token::ID,
-        }.to_account_metas(None),
+        }
+        .to_account_metas(None),
     );
 
     let blockhash = f.svm.latest_blockhash();
@@ -344,18 +845,30 @@ fn test_swap_a_to_b() {
     // --- Verify ---
     // Swapper should have received Token B
     let swapper_b_data = f.svm.get_account(&swapper_token_b.pubkey()).unwrap().data;
-    let swapper_b_state = anchor_spl::token::TokenAccount::try_deserialize(&mut swapper_b_data.as_slice()).unwrap();
-    assert!(swapper_b_state.amount > 0, "Swapper should have received Token B");
+    let swapper_b_state =
+        anchor_spl::token::TokenAccount::try_deserialize(&mut swapper_b_data.as_slice()).unwrap();
+    assert!(
+        swapper_b_state.amount > 0,
+        "Swapper should have received Token B"
+    );
 
     // Treasury should have received protocol fee
-    let treasury_data = f.svm.get_account(&treasury.pubkey()).unwrap().data;
-    let treasury_state = anchor_spl::token::TokenAccount::try_deserialize(&mut treasury_data.as_slice()).unwrap();
-    assert!(treasury_state.amount > 0, "Treasury should have received protocol fee");
+    let treasury_data = f.svm.get_account(&treasury_a.pubkey()).unwrap().data;
+    let treasury_state =
+        anchor_spl::token::TokenAccount::try_deserialize(&mut treasury_data.as_slice()).unwrap();
+    assert!(
+        treasury_state.amount > 0,
+        "Treasury should have received protocol fee"
+    );
 
     // k_last should have grown (LP fee stayed in vault)
     let pool_data = f.svm.get_account(&pool2_pda).unwrap().data;
-    let pool_state = exia_amm::state::PoolState::try_deserialize(&mut pool_data.as_slice()).unwrap();
-    assert!(pool_state.k_last > liquidity_a as u128 * liquidity_b as u128, "k_last should grow after swap");
+    let pool_state =
+        exia_amm::state::PoolState::try_deserialize(&mut pool_data.as_slice()).unwrap();
+    assert!(
+        pool_state.k_last > liquidity_a as u128 * liquidity_b as u128,
+        "k_last should grow after swap"
+    );
 
     println!("SUCCESS! Swap A→B passed.");
     println!("  Token B received: {}", swapper_b_state.amount);
@@ -376,26 +889,95 @@ fn test_remove_liquidity() {
     let user_lp_token = Keypair::new();
 
     // Create user token accounts
-    send_tx(&mut f.svm, &f.payer, vec![
-        system_instruction::create_account(&f.payer.pubkey(), &user_token_a.pubkey(), token_account_rent, token_account_space, &anchor_spl::token::ID),
-        anchor_spl::token::spl_token::instruction::initialize_account(&anchor_spl::token::ID, &user_token_a.pubkey(), &f.token_a_mint.pubkey(), &f.payer.pubkey()).unwrap(),
-        system_instruction::create_account(&f.payer.pubkey(), &user_token_b.pubkey(), token_account_rent, token_account_space, &anchor_spl::token::ID),
-        anchor_spl::token::spl_token::instruction::initialize_account(&anchor_spl::token::ID, &user_token_b.pubkey(), &f.token_b_mint.pubkey(), &f.payer.pubkey()).unwrap(),
-        system_instruction::create_account(&f.payer.pubkey(), &user_lp_token.pubkey(), token_account_rent, token_account_space, &anchor_spl::token::ID),
-        anchor_spl::token::spl_token::instruction::initialize_account(&anchor_spl::token::ID, &user_lp_token.pubkey(), &f.lp_mint_pda, &f.payer.pubkey()).unwrap(),
-    ], &[&f.payer.insecure_clone(), &user_token_a, &user_token_b, &user_lp_token]);
+    send_tx(
+        &mut f.svm,
+        &f.payer,
+        vec![
+            system_instruction::create_account(
+                &f.payer.pubkey(),
+                &user_token_a.pubkey(),
+                token_account_rent,
+                token_account_space,
+                &anchor_spl::token::ID,
+            ),
+            anchor_spl::token::spl_token::instruction::initialize_account(
+                &anchor_spl::token::ID,
+                &user_token_a.pubkey(),
+                &f.token_a_mint.pubkey(),
+                &f.payer.pubkey(),
+            )
+            .unwrap(),
+            system_instruction::create_account(
+                &f.payer.pubkey(),
+                &user_token_b.pubkey(),
+                token_account_rent,
+                token_account_space,
+                &anchor_spl::token::ID,
+            ),
+            anchor_spl::token::spl_token::instruction::initialize_account(
+                &anchor_spl::token::ID,
+                &user_token_b.pubkey(),
+                &f.token_b_mint.pubkey(),
+                &f.payer.pubkey(),
+            )
+            .unwrap(),
+            system_instruction::create_account(
+                &f.payer.pubkey(),
+                &user_lp_token.pubkey(),
+                token_account_rent,
+                token_account_space,
+                &anchor_spl::token::ID,
+            ),
+            anchor_spl::token::spl_token::instruction::initialize_account(
+                &anchor_spl::token::ID,
+                &user_lp_token.pubkey(),
+                &f.lp_mint_pda,
+                &f.payer.pubkey(),
+            )
+            .unwrap(),
+        ],
+        &[
+            &f.payer.insecure_clone(),
+            &user_token_a,
+            &user_token_b,
+            &user_lp_token,
+        ],
+    );
 
     // Fund and add liquidity
     let amount_a: u64 = 10_000_000;
     let amount_b: u64 = 20_000_000;
 
-    send_tx(&mut f.svm, &f.payer, vec![
-        anchor_spl::token::spl_token::instruction::mint_to(&anchor_spl::token::ID, &f.token_a_mint.pubkey(), &user_token_a.pubkey(), &f.payer.pubkey(), &[], amount_a).unwrap(),
-        anchor_spl::token::spl_token::instruction::mint_to(&anchor_spl::token::ID, &f.token_b_mint.pubkey(), &user_token_b.pubkey(), &f.payer.pubkey(), &[], amount_b).unwrap(),
-    ], &[&f.payer.insecure_clone()]);
+    send_tx(
+        &mut f.svm,
+        &f.payer,
+        vec![
+            anchor_spl::token::spl_token::instruction::mint_to(
+                &anchor_spl::token::ID,
+                &f.token_a_mint.pubkey(),
+                &user_token_a.pubkey(),
+                &f.payer.pubkey(),
+                &[],
+                amount_a,
+            )
+            .unwrap(),
+            anchor_spl::token::spl_token::instruction::mint_to(
+                &anchor_spl::token::ID,
+                &f.token_b_mint.pubkey(),
+                &user_token_b.pubkey(),
+                &f.payer.pubkey(),
+                &[],
+                amount_b,
+            )
+            .unwrap(),
+        ],
+        &[&f.payer.insecure_clone()],
+    );
 
-    send_tx(&mut f.svm, &f.payer, vec![
-        Instruction::new_with_bytes(
+    send_tx(
+        &mut f.svm,
+        &f.payer,
+        vec![Instruction::new_with_bytes(
             program_id,
             &exia_amm::instruction::AddLiquidity { amount_a, amount_b }.data(),
             exia_amm::accounts::AddLiquidity {
@@ -409,13 +991,16 @@ fn test_remove_liquidity() {
                 lp_mint: f.lp_mint_pda,
                 token_program: anchor_spl::token::ID,
                 system_program: system_program::ID,
-            }.to_account_metas(None),
-        )
-    ], &[&f.payer.insecure_clone()]);
+            }
+            .to_account_metas(None),
+        )],
+        &[&f.payer.insecure_clone()],
+    );
 
     // Record LP balance before removal
     let lp_data_before = f.svm.get_account(&user_lp_token.pubkey()).unwrap().data;
-    let lp_state_before = anchor_spl::token::TokenAccount::try_deserialize(&mut lp_data_before.as_slice()).unwrap();
+    let lp_state_before =
+        anchor_spl::token::TokenAccount::try_deserialize(&mut lp_data_before.as_slice()).unwrap();
     let lp_balance = lp_state_before.amount;
     assert!(lp_balance > 0, "User should have LP tokens before removal");
 
@@ -424,7 +1009,10 @@ fn test_remove_liquidity() {
 
     let remove_ix = Instruction::new_with_bytes(
         program_id,
-        &exia_amm::instruction::RemoveLiquidity { lp_amount: lp_to_burn }.data(),
+        &exia_amm::instruction::RemoveLiquidity {
+            lp_amount: lp_to_burn,
+        }
+        .data(),
         exia_amm::accounts::RemoveLiquidity {
             user: f.payer.pubkey(),
             pool_state: f.pool_state_pda,
@@ -435,38 +1023,61 @@ fn test_remove_liquidity() {
             vault_b: f.vault_b_pda,
             lp_mint: f.lp_mint_pda,
             token_program: anchor_spl::token::ID,
-        }.to_account_metas(None),
+        }
+        .to_account_metas(None),
     );
 
     let blockhash = f.svm.latest_blockhash();
     let msg = Message::new_with_blockhash(&[remove_ix], Some(&f.payer.pubkey()), &blockhash);
-    let tx = VersionedTransaction::try_new(VersionedMessage::Legacy(msg), &[&f.payer.insecure_clone()]).unwrap();
+    let tx =
+        VersionedTransaction::try_new(VersionedMessage::Legacy(msg), &[&f.payer.insecure_clone()])
+            .unwrap();
     let res = f.svm.send_transaction(tx);
     assert!(res.is_ok(), "remove_liquidity failed: {:?}", res);
 
     // LP balance should have decreased
     let lp_data_after = f.svm.get_account(&user_lp_token.pubkey()).unwrap().data;
-    let lp_state_after = anchor_spl::token::TokenAccount::try_deserialize(&mut lp_data_after.as_slice()).unwrap();
-    assert_eq!(lp_state_after.amount, lp_balance - lp_to_burn, "LP tokens should be burned");
+    let lp_state_after =
+        anchor_spl::token::TokenAccount::try_deserialize(&mut lp_data_after.as_slice()).unwrap();
+    assert_eq!(
+        lp_state_after.amount,
+        lp_balance - lp_to_burn,
+        "LP tokens should be burned"
+    );
 
     // User should have received tokens back
     let token_a_data = f.svm.get_account(&user_token_a.pubkey()).unwrap().data;
-    let token_a_state = anchor_spl::token::TokenAccount::try_deserialize(&mut token_a_data.as_slice()).unwrap();
-    assert!(token_a_state.amount > 0, "User should have received Token A back");
+    let token_a_state =
+        anchor_spl::token::TokenAccount::try_deserialize(&mut token_a_data.as_slice()).unwrap();
+    assert!(
+        token_a_state.amount > 0,
+        "User should have received Token A back"
+    );
 
     let token_b_data = f.svm.get_account(&user_token_b.pubkey()).unwrap().data;
-    let token_b_state = anchor_spl::token::TokenAccount::try_deserialize(&mut token_b_data.as_slice()).unwrap();
-    assert!(token_b_state.amount > 0, "User should have received Token B back");
+    let token_b_state =
+        anchor_spl::token::TokenAccount::try_deserialize(&mut token_b_data.as_slice()).unwrap();
+    assert!(
+        token_b_state.amount > 0,
+        "User should have received Token B back"
+    );
 
     // k_last should have decreased
     let pool_data = f.svm.get_account(&f.pool_state_pda).unwrap().data;
-    let pool_state = exia_amm::state::PoolState::try_deserialize(&mut pool_data.as_slice()).unwrap();
-    assert!(pool_state.k_last < amount_a as u128 * amount_b as u128, "k_last should decrease after removal");
+    let pool_state =
+        exia_amm::state::PoolState::try_deserialize(&mut pool_data.as_slice()).unwrap();
+    assert!(
+        pool_state.k_last < amount_a as u128 * amount_b as u128,
+        "k_last should decrease after removal"
+    );
 
     println!("SUCCESS! remove_liquidity passed.");
     println!("  Token A returned: {}", token_a_state.amount);
     println!("  Token B returned: {}", token_b_state.amount);
-    println!("  LP burned: {}, remaining: {}", lp_to_burn, lp_state_after.amount);
+    println!(
+        "  LP burned: {}, remaining: {}",
+        lp_to_burn, lp_state_after.amount
+    );
     println!("  k_last after removal: {}", pool_state.k_last);
 }
 
@@ -487,47 +1098,126 @@ fn test_twap_accumulates_after_swap() {
     f.svm.airdrop(&payer2.pubkey(), 100_000_000_000).unwrap();
 
     let (pool2_pda, _) = Pubkey::find_program_address(
-        &[b"pool", token_a_mint2.pubkey().as_ref(), token_b_mint2.pubkey().as_ref()],
+        &[
+            b"pool",
+            token_a_mint2.pubkey().as_ref(),
+            token_b_mint2.pubkey().as_ref(),
+        ],
         &program_id,
     );
-    let (vault_a2, _) = Pubkey::find_program_address(&[b"vault_a", pool2_pda.as_ref()], &program_id);
-    let (vault_b2, _) = Pubkey::find_program_address(&[b"vault_b", pool2_pda.as_ref()], &program_id);
-    let (lp_mint2, _) = Pubkey::find_program_address(&[b"lp_mint", pool2_pda.as_ref()], &program_id);
+    let (vault_a2, _) =
+        Pubkey::find_program_address(&[b"vault_a", pool2_pda.as_ref()], &program_id);
+    let (vault_b2, _) =
+        Pubkey::find_program_address(&[b"vault_b", pool2_pda.as_ref()], &program_id);
+    let (lp_mint2, _) =
+        Pubkey::find_program_address(&[b"lp_mint", pool2_pda.as_ref()], &program_id);
 
-    let treasury = Keypair::new();
+    let treasury_a = Keypair::new();
+    let treasury_b = Keypair::new();
 
-    send_tx(&mut f.svm, &payer2, vec![
-        system_instruction::create_account(&payer2.pubkey(), &token_a_mint2.pubkey(), mint_rent, mint_space, &anchor_spl::token::ID),
-        anchor_spl::token::spl_token::instruction::initialize_mint(&anchor_spl::token::ID, &token_a_mint2.pubkey(), &payer2.pubkey(), None, 6).unwrap(),
-        system_instruction::create_account(&payer2.pubkey(), &token_b_mint2.pubkey(), mint_rent, mint_space, &anchor_spl::token::ID),
-        anchor_spl::token::spl_token::instruction::initialize_mint(&anchor_spl::token::ID, &token_b_mint2.pubkey(), &payer2.pubkey(), None, 6).unwrap(),
-        system_instruction::create_account(&payer2.pubkey(), &treasury.pubkey(), token_account_rent, token_account_space, &anchor_spl::token::ID),
-        anchor_spl::token::spl_token::instruction::initialize_account(&anchor_spl::token::ID, &treasury.pubkey(), &token_a_mint2.pubkey(), &payer2.pubkey()).unwrap(),
-    ], &[&payer2, &token_a_mint2, &token_b_mint2, &treasury]);
+    send_tx(
+        &mut f.svm,
+        &payer2,
+        vec![
+            system_instruction::create_account(
+                &payer2.pubkey(),
+                &token_a_mint2.pubkey(),
+                mint_rent,
+                mint_space,
+                &anchor_spl::token::ID,
+            ),
+            anchor_spl::token::spl_token::instruction::initialize_mint(
+                &anchor_spl::token::ID,
+                &token_a_mint2.pubkey(),
+                &payer2.pubkey(),
+                None,
+                6,
+            )
+            .unwrap(),
+            system_instruction::create_account(
+                &payer2.pubkey(),
+                &token_b_mint2.pubkey(),
+                mint_rent,
+                mint_space,
+                &anchor_spl::token::ID,
+            ),
+            anchor_spl::token::spl_token::instruction::initialize_mint(
+                &anchor_spl::token::ID,
+                &token_b_mint2.pubkey(),
+                &payer2.pubkey(),
+                None,
+                6,
+            )
+            .unwrap(),
+            system_instruction::create_account(
+                &payer2.pubkey(),
+                &treasury_a.pubkey(),
+                token_account_rent,
+                token_account_space,
+                &anchor_spl::token::ID,
+            ),
+            anchor_spl::token::spl_token::instruction::initialize_account(
+                &anchor_spl::token::ID,
+                &treasury_a.pubkey(),
+                &token_a_mint2.pubkey(),
+                &payer2.pubkey(),
+            )
+            .unwrap(),
+            system_instruction::create_account(
+                &payer2.pubkey(),
+                &treasury_b.pubkey(),
+                token_account_rent,
+                token_account_space,
+                &anchor_spl::token::ID,
+            ),
+            anchor_spl::token::spl_token::instruction::initialize_account(
+                &anchor_spl::token::ID,
+                &treasury_b.pubkey(),
+                &token_b_mint2.pubkey(),
+                &payer2.pubkey(),
+            )
+            .unwrap(),
+        ],
+        &[
+            &payer2,
+            &token_a_mint2,
+            &token_b_mint2,
+            &treasury_a,
+            &treasury_b,
+        ],
+    );
 
-    send_tx(&mut f.svm, &payer2, vec![
-        Instruction::new_with_bytes(
+    send_tx(
+        &mut f.svm,
+        &payer2,
+        vec![Instruction::new_with_bytes(
             program_id,
             &exia_amm::instruction::InitializePool {
                 lp_fee_bps: 25,
                 protocol_fee_bps: 5,
-                treasury_wallet: treasury.pubkey(),
                 authority: payer2.pubkey(),
-            }.data(),
+            }
+            .data(),
             exia_amm::accounts::InitializePool {
                 payer: payer2.pubkey(),
                 pool_state: pool2_pda,
                 token_a_mint: token_a_mint2.pubkey(),
                 token_b_mint: token_b_mint2.pubkey(),
+                treasury_token_a: treasury_a.pubkey(),
+                treasury_token_b: treasury_b.pubkey(),
                 vault_a: vault_a2,
                 vault_b: vault_b2,
                 lp_mint: lp_mint2,
                 token_program: anchor_spl::token::ID,
                 system_program: system_program::ID,
-                rent: "SysvarRent111111111111111111111111111111111".parse().unwrap(),
-            }.to_account_metas(None),
-        )
-    ], &[&payer2]);
+                rent: "SysvarRent111111111111111111111111111111111"
+                    .parse()
+                    .unwrap(),
+            }
+            .to_account_metas(None),
+        )],
+        &[&payer2],
+    );
 
     // Add liquidity
     let user_token_a = Keypair::new();
@@ -536,29 +1226,136 @@ fn test_twap_accumulates_after_swap() {
     let swapper_a = Keypair::new();
     let swapper_b = Keypair::new();
 
-    send_tx(&mut f.svm, &payer2, vec![
-        system_instruction::create_account(&payer2.pubkey(), &user_token_a.pubkey(), token_account_rent, token_account_space, &anchor_spl::token::ID),
-        anchor_spl::token::spl_token::instruction::initialize_account(&anchor_spl::token::ID, &user_token_a.pubkey(), &token_a_mint2.pubkey(), &payer2.pubkey()).unwrap(),
-        system_instruction::create_account(&payer2.pubkey(), &user_token_b.pubkey(), token_account_rent, token_account_space, &anchor_spl::token::ID),
-        anchor_spl::token::spl_token::instruction::initialize_account(&anchor_spl::token::ID, &user_token_b.pubkey(), &token_b_mint2.pubkey(), &payer2.pubkey()).unwrap(),
-        system_instruction::create_account(&payer2.pubkey(), &user_lp.pubkey(), token_account_rent, token_account_space, &anchor_spl::token::ID),
-        anchor_spl::token::spl_token::instruction::initialize_account(&anchor_spl::token::ID, &user_lp.pubkey(), &lp_mint2, &payer2.pubkey()).unwrap(),
-        system_instruction::create_account(&payer2.pubkey(), &swapper_a.pubkey(), token_account_rent, token_account_space, &anchor_spl::token::ID),
-        anchor_spl::token::spl_token::instruction::initialize_account(&anchor_spl::token::ID, &swapper_a.pubkey(), &token_a_mint2.pubkey(), &payer2.pubkey()).unwrap(),
-        system_instruction::create_account(&payer2.pubkey(), &swapper_b.pubkey(), token_account_rent, token_account_space, &anchor_spl::token::ID),
-        anchor_spl::token::spl_token::instruction::initialize_account(&anchor_spl::token::ID, &swapper_b.pubkey(), &token_b_mint2.pubkey(), &payer2.pubkey()).unwrap(),
-    ], &[&payer2, &user_token_a, &user_token_b, &user_lp, &swapper_a, &swapper_b]);
+    send_tx(
+        &mut f.svm,
+        &payer2,
+        vec![
+            system_instruction::create_account(
+                &payer2.pubkey(),
+                &user_token_a.pubkey(),
+                token_account_rent,
+                token_account_space,
+                &anchor_spl::token::ID,
+            ),
+            anchor_spl::token::spl_token::instruction::initialize_account(
+                &anchor_spl::token::ID,
+                &user_token_a.pubkey(),
+                &token_a_mint2.pubkey(),
+                &payer2.pubkey(),
+            )
+            .unwrap(),
+            system_instruction::create_account(
+                &payer2.pubkey(),
+                &user_token_b.pubkey(),
+                token_account_rent,
+                token_account_space,
+                &anchor_spl::token::ID,
+            ),
+            anchor_spl::token::spl_token::instruction::initialize_account(
+                &anchor_spl::token::ID,
+                &user_token_b.pubkey(),
+                &token_b_mint2.pubkey(),
+                &payer2.pubkey(),
+            )
+            .unwrap(),
+            system_instruction::create_account(
+                &payer2.pubkey(),
+                &user_lp.pubkey(),
+                token_account_rent,
+                token_account_space,
+                &anchor_spl::token::ID,
+            ),
+            anchor_spl::token::spl_token::instruction::initialize_account(
+                &anchor_spl::token::ID,
+                &user_lp.pubkey(),
+                &lp_mint2,
+                &payer2.pubkey(),
+            )
+            .unwrap(),
+            system_instruction::create_account(
+                &payer2.pubkey(),
+                &swapper_a.pubkey(),
+                token_account_rent,
+                token_account_space,
+                &anchor_spl::token::ID,
+            ),
+            anchor_spl::token::spl_token::instruction::initialize_account(
+                &anchor_spl::token::ID,
+                &swapper_a.pubkey(),
+                &token_a_mint2.pubkey(),
+                &payer2.pubkey(),
+            )
+            .unwrap(),
+            system_instruction::create_account(
+                &payer2.pubkey(),
+                &swapper_b.pubkey(),
+                token_account_rent,
+                token_account_space,
+                &anchor_spl::token::ID,
+            ),
+            anchor_spl::token::spl_token::instruction::initialize_account(
+                &anchor_spl::token::ID,
+                &swapper_b.pubkey(),
+                &token_b_mint2.pubkey(),
+                &payer2.pubkey(),
+            )
+            .unwrap(),
+        ],
+        &[
+            &payer2,
+            &user_token_a,
+            &user_token_b,
+            &user_lp,
+            &swapper_a,
+            &swapper_b,
+        ],
+    );
 
-    send_tx(&mut f.svm, &payer2, vec![
-        anchor_spl::token::spl_token::instruction::mint_to(&anchor_spl::token::ID, &token_a_mint2.pubkey(), &user_token_a.pubkey(), &payer2.pubkey(), &[], 100_000_000).unwrap(),
-        anchor_spl::token::spl_token::instruction::mint_to(&anchor_spl::token::ID, &token_b_mint2.pubkey(), &user_token_b.pubkey(), &payer2.pubkey(), &[], 100_000_000).unwrap(),
-        anchor_spl::token::spl_token::instruction::mint_to(&anchor_spl::token::ID, &token_a_mint2.pubkey(), &swapper_a.pubkey(), &payer2.pubkey(), &[], 1_000_000).unwrap(),
-    ], &[&payer2]);
+    send_tx(
+        &mut f.svm,
+        &payer2,
+        vec![
+            anchor_spl::token::spl_token::instruction::mint_to(
+                &anchor_spl::token::ID,
+                &token_a_mint2.pubkey(),
+                &user_token_a.pubkey(),
+                &payer2.pubkey(),
+                &[],
+                100_000_000,
+            )
+            .unwrap(),
+            anchor_spl::token::spl_token::instruction::mint_to(
+                &anchor_spl::token::ID,
+                &token_b_mint2.pubkey(),
+                &user_token_b.pubkey(),
+                &payer2.pubkey(),
+                &[],
+                100_000_000,
+            )
+            .unwrap(),
+            anchor_spl::token::spl_token::instruction::mint_to(
+                &anchor_spl::token::ID,
+                &token_a_mint2.pubkey(),
+                &swapper_a.pubkey(),
+                &payer2.pubkey(),
+                &[],
+                1_000_000,
+            )
+            .unwrap(),
+        ],
+        &[&payer2],
+    );
 
-    send_tx(&mut f.svm, &payer2, vec![
-        Instruction::new_with_bytes(
+    send_tx(
+        &mut f.svm,
+        &payer2,
+        vec![Instruction::new_with_bytes(
             program_id,
-            &exia_amm::instruction::AddLiquidity { amount_a: 100_000_000, amount_b: 100_000_000 }.data(),
+            &exia_amm::instruction::AddLiquidity {
+                amount_a: 100_000_000,
+                amount_b: 100_000_000,
+            }
+            .data(),
             exia_amm::accounts::AddLiquidity {
                 user: payer2.pubkey(),
                 pool_state: pool2_pda,
@@ -570,13 +1367,16 @@ fn test_twap_accumulates_after_swap() {
                 lp_mint: lp_mint2,
                 token_program: anchor_spl::token::ID,
                 system_program: system_program::ID,
-            }.to_account_metas(None),
-        )
-    ], &[&payer2]);
+            }
+            .to_account_metas(None),
+        )],
+        &[&payer2],
+    );
 
     // Record TWAP state before swap
     let pool_data_before = f.svm.get_account(&pool2_pda).unwrap().data;
-    let pool_before = exia_amm::state::PoolState::try_deserialize(&mut pool_data_before.as_slice()).unwrap();
+    let pool_before =
+        exia_amm::state::PoolState::try_deserialize(&mut pool_data_before.as_slice()).unwrap();
     let price_a_before = pool_before.price_a_cumulative_last;
     let ts_before = pool_before.block_timestamp_last;
 
@@ -587,7 +1387,8 @@ fn test_twap_accumulates_after_swap() {
             amount_in: 1_000_000,
             minimum_amount_out: 1,
             a_to_b: true,
-        }.data(),
+        }
+        .data(),
         exia_amm::accounts::Swap {
             user: payer2.pubkey(),
             pool_state: pool2_pda,
@@ -595,9 +1396,10 @@ fn test_twap_accumulates_after_swap() {
             user_token_out: swapper_b.pubkey(),
             vault_a: vault_a2,
             vault_b: vault_b2,
-            treasury_token_in: treasury.pubkey(),
+            treasury_token_in: treasury_a.pubkey(),
             token_program: anchor_spl::token::ID,
-        }.to_account_metas(None),
+        }
+        .to_account_metas(None),
     );
 
     let blockhash = f.svm.latest_blockhash();
@@ -607,19 +1409,479 @@ fn test_twap_accumulates_after_swap() {
 
     // Verify TWAP updated
     let pool_data_after = f.svm.get_account(&pool2_pda).unwrap().data;
-    let pool_after = exia_amm::state::PoolState::try_deserialize(&mut pool_data_after.as_slice()).unwrap();
+    let pool_after =
+        exia_amm::state::PoolState::try_deserialize(&mut pool_data_after.as_slice()).unwrap();
 
     // In litesvm, time may not advance between txs (same block) so elapsed=0
     // is valid — TWAP only accumulates when time actually passes.
     // We verify the fields are at least set and haven't corrupted.
-    assert!(pool_after.price_a_cumulative_last >= price_a_before,
-        "price_a_cumulative should never decrease");
-    assert!(pool_after.block_timestamp_last >= ts_before,
-        "timestamp should never go backwards");
+    assert!(
+        pool_after.price_a_cumulative_last >= price_a_before,
+        "price_a_cumulative should never decrease"
+    );
+    assert!(
+        pool_after.block_timestamp_last >= ts_before,
+        "timestamp should never go backwards"
+    );
 
     println!("SUCCESS! TWAP test passed.");
     println!("  price_a_cumulative before: {}", price_a_before);
-    println!("  price_a_cumulative after:  {}", pool_after.price_a_cumulative_last);
+    println!(
+        "  price_a_cumulative after:  {}",
+        pool_after.price_a_cumulative_last
+    );
     println!("  timestamp before: {}", ts_before);
     println!("  timestamp after:  {}", pool_after.block_timestamp_last);
+}
+
+#[test]
+fn test_second_liquidity_deposit_uses_pre_deposit_reserves() {
+    let mut f = setup_initialized_pool();
+
+    let (_, _, _, first_lp) = add_fixture_liquidity(&mut f, 10_000_000, 20_000_000);
+    let (_, _, second_lp_token, second_lp) = add_fixture_liquidity(&mut f, 5_000_000, 10_000_000);
+
+    assert_eq!(
+        second_lp,
+        first_lp / 2,
+        "second depositor should receive proportional LP shares"
+    );
+    assert_eq!(token_amount(&f.svm, &second_lp_token.pubkey()), second_lp);
+}
+
+#[test]
+fn test_swap_b_to_a_collects_token_b_protocol_fee() {
+    let mut f = setup_initialized_pool();
+    let payer = f.payer.insecure_clone();
+
+    add_fixture_liquidity(&mut f, 100_000_000, 100_000_000);
+
+    let swapper_token_a = create_token_account(
+        &mut f.svm,
+        &payer,
+        &f.token_a_mint.pubkey(),
+        &payer.pubkey(),
+    );
+    let swapper_token_b = create_token_account(
+        &mut f.svm,
+        &payer,
+        &f.token_b_mint.pubkey(),
+        &payer.pubkey(),
+    );
+    mint_to_account(
+        &mut f.svm,
+        &payer,
+        &f.token_b_mint.pubkey(),
+        &swapper_token_b.pubkey(),
+        1_000_000,
+    );
+
+    send_tx(
+        &mut f.svm,
+        &payer,
+        vec![Instruction::new_with_bytes(
+            exia_amm::id(),
+            &exia_amm::instruction::Swap {
+                amount_in: 1_000_000,
+                minimum_amount_out: 1,
+                a_to_b: false,
+            }
+            .data(),
+            exia_amm::accounts::Swap {
+                user: payer.pubkey(),
+                pool_state: f.pool_state_pda,
+                user_token_in: swapper_token_b.pubkey(),
+                user_token_out: swapper_token_a.pubkey(),
+                vault_a: f.vault_a_pda,
+                vault_b: f.vault_b_pda,
+                treasury_token_in: f.treasury_token_b.pubkey(),
+                token_program: anchor_spl::token::ID,
+            }
+            .to_account_metas(None),
+        )],
+        &[&payer],
+    );
+
+    assert!(
+        token_amount(&f.svm, &swapper_token_a.pubkey()) > 0,
+        "swapper should receive Token A"
+    );
+    assert!(
+        token_amount(&f.svm, &f.treasury_token_b.pubkey()) > 0,
+        "Token B treasury should receive protocol fees"
+    );
+    assert_eq!(
+        token_amount(&f.svm, &f.treasury_token_a.pubkey()),
+        0,
+        "Token A treasury should not receive B -> A fees"
+    );
+}
+
+#[test]
+fn test_swap_rejects_wrong_direction_treasury() {
+    let mut f = setup_initialized_pool();
+    let payer = f.payer.insecure_clone();
+
+    add_fixture_liquidity(&mut f, 100_000_000, 100_000_000);
+
+    let swapper_token_a = create_token_account(
+        &mut f.svm,
+        &payer,
+        &f.token_a_mint.pubkey(),
+        &payer.pubkey(),
+    );
+    let swapper_token_b = create_token_account(
+        &mut f.svm,
+        &payer,
+        &f.token_b_mint.pubkey(),
+        &payer.pubkey(),
+    );
+    mint_to_account(
+        &mut f.svm,
+        &payer,
+        &f.token_b_mint.pubkey(),
+        &swapper_token_b.pubkey(),
+        1_000_000,
+    );
+
+    let ok = tx_succeeds(
+        &mut f.svm,
+        &payer,
+        vec![Instruction::new_with_bytes(
+            exia_amm::id(),
+            &exia_amm::instruction::Swap {
+                amount_in: 1_000_000,
+                minimum_amount_out: 1,
+                a_to_b: false,
+            }
+            .data(),
+            exia_amm::accounts::Swap {
+                user: payer.pubkey(),
+                pool_state: f.pool_state_pda,
+                user_token_in: swapper_token_b.pubkey(),
+                user_token_out: swapper_token_a.pubkey(),
+                vault_a: f.vault_a_pda,
+                vault_b: f.vault_b_pda,
+                treasury_token_in: f.treasury_token_a.pubkey(),
+                token_program: anchor_spl::token::ID,
+            }
+            .to_account_metas(None),
+        )],
+        &[&payer],
+    );
+
+    assert!(!ok, "B -> A swap should reject Token A treasury");
+}
+
+#[test]
+fn test_initialize_rejects_excessive_fees() {
+    let program_id = exia_amm::id();
+    let payer = Keypair::new();
+    let token_a_mint = Keypair::new();
+    let token_b_mint = Keypair::new();
+    let treasury_token_a = Keypair::new();
+    let treasury_token_b = Keypair::new();
+
+    let (pool_state_pda, _) = Pubkey::find_program_address(
+        &[
+            b"pool",
+            token_a_mint.pubkey().as_ref(),
+            token_b_mint.pubkey().as_ref(),
+        ],
+        &program_id,
+    );
+    let (vault_a_pda, _) =
+        Pubkey::find_program_address(&[b"vault_a", pool_state_pda.as_ref()], &program_id);
+    let (vault_b_pda, _) =
+        Pubkey::find_program_address(&[b"vault_b", pool_state_pda.as_ref()], &program_id);
+    let (lp_mint_pda, _) =
+        Pubkey::find_program_address(&[b"lp_mint", pool_state_pda.as_ref()], &program_id);
+
+    let mut svm = LiteSVM::new();
+    let bytes = include_bytes!(concat!(
+        env!("CARGO_TARGET_TMPDIR"),
+        "/../deploy/exia_amm.so"
+    ));
+    svm.add_program(program_id, bytes).unwrap();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+
+    let mint_space = anchor_spl::token::Mint::LEN as u64;
+    let mint_rent = Rent::default().minimum_balance(mint_space as usize);
+    let token_account_space = anchor_spl::token::TokenAccount::LEN as u64;
+    let token_account_rent = Rent::default().minimum_balance(token_account_space as usize);
+
+    send_tx(
+        &mut svm,
+        &payer,
+        vec![
+            system_instruction::create_account(
+                &payer.pubkey(),
+                &token_a_mint.pubkey(),
+                mint_rent,
+                mint_space,
+                &anchor_spl::token::ID,
+            ),
+            anchor_spl::token::spl_token::instruction::initialize_mint(
+                &anchor_spl::token::ID,
+                &token_a_mint.pubkey(),
+                &payer.pubkey(),
+                None,
+                6,
+            )
+            .unwrap(),
+            system_instruction::create_account(
+                &payer.pubkey(),
+                &token_b_mint.pubkey(),
+                mint_rent,
+                mint_space,
+                &anchor_spl::token::ID,
+            ),
+            anchor_spl::token::spl_token::instruction::initialize_mint(
+                &anchor_spl::token::ID,
+                &token_b_mint.pubkey(),
+                &payer.pubkey(),
+                None,
+                6,
+            )
+            .unwrap(),
+            system_instruction::create_account(
+                &payer.pubkey(),
+                &treasury_token_a.pubkey(),
+                token_account_rent,
+                token_account_space,
+                &anchor_spl::token::ID,
+            ),
+            anchor_spl::token::spl_token::instruction::initialize_account(
+                &anchor_spl::token::ID,
+                &treasury_token_a.pubkey(),
+                &token_a_mint.pubkey(),
+                &payer.pubkey(),
+            )
+            .unwrap(),
+            system_instruction::create_account(
+                &payer.pubkey(),
+                &treasury_token_b.pubkey(),
+                token_account_rent,
+                token_account_space,
+                &anchor_spl::token::ID,
+            ),
+            anchor_spl::token::spl_token::instruction::initialize_account(
+                &anchor_spl::token::ID,
+                &treasury_token_b.pubkey(),
+                &token_b_mint.pubkey(),
+                &payer.pubkey(),
+            )
+            .unwrap(),
+        ],
+        &[
+            &payer,
+            &token_a_mint,
+            &token_b_mint,
+            &treasury_token_a,
+            &treasury_token_b,
+        ],
+    );
+
+    let ok = tx_succeeds(
+        &mut svm,
+        &payer,
+        vec![Instruction::new_with_bytes(
+            program_id,
+            &exia_amm::instruction::InitializePool {
+                lp_fee_bps: 501,
+                protocol_fee_bps: 5,
+                authority: payer.pubkey(),
+            }
+            .data(),
+            exia_amm::accounts::InitializePool {
+                payer: payer.pubkey(),
+                pool_state: pool_state_pda,
+                token_a_mint: token_a_mint.pubkey(),
+                token_b_mint: token_b_mint.pubkey(),
+                treasury_token_a: treasury_token_a.pubkey(),
+                treasury_token_b: treasury_token_b.pubkey(),
+                vault_a: vault_a_pda,
+                vault_b: vault_b_pda,
+                lp_mint: lp_mint_pda,
+                token_program: anchor_spl::token::ID,
+                system_program: system_program::ID,
+                rent: "SysvarRent111111111111111111111111111111111"
+                    .parse()
+                    .unwrap(),
+            }
+            .to_account_metas(None),
+        )],
+        &[&payer],
+    );
+
+    assert!(!ok, "initialize_pool should reject excessive fees");
+}
+
+#[test]
+fn test_admin_authority_transfer_and_old_authority_rejection() {
+    let mut f = setup_initialized_pool();
+    let old_authority = f.payer.insecure_clone();
+    let new_authority = Keypair::new();
+
+    send_tx(
+        &mut f.svm,
+        &old_authority,
+        vec![Instruction::new_with_bytes(
+            exia_amm::id(),
+            &exia_amm::instruction::ProposeAuthority {
+                new_authority: new_authority.pubkey(),
+            }
+            .data(),
+            exia_amm::accounts::ProposeAuthority {
+                authority: old_authority.pubkey(),
+                pool_state: f.pool_state_pda,
+            }
+            .to_account_metas(None),
+        )],
+        &[&old_authority],
+    );
+
+    send_tx(
+        &mut f.svm,
+        &old_authority,
+        vec![Instruction::new_with_bytes(
+            exia_amm::id(),
+            &exia_amm::instruction::AcceptAuthority {}.data(),
+            exia_amm::accounts::AcceptAuthority {
+                new_authority: new_authority.pubkey(),
+                pool_state: f.pool_state_pda,
+            }
+            .to_account_metas(None),
+        )],
+        &[&old_authority, &new_authority],
+    );
+
+    assert_eq!(
+        pool_state(&f.svm, &f.pool_state_pda).authority,
+        new_authority.pubkey()
+    );
+
+    let old_authority_still_controls = tx_succeeds(
+        &mut f.svm,
+        &old_authority,
+        vec![Instruction::new_with_bytes(
+            exia_amm::id(),
+            &exia_amm::instruction::UpdateFees {
+                new_lp_fee_bps: 30,
+                new_protocol_fee_bps: 5,
+            }
+            .data(),
+            exia_amm::accounts::UpdateFees {
+                authority: old_authority.pubkey(),
+                pool_state: f.pool_state_pda,
+            }
+            .to_account_metas(None),
+        )],
+        &[&old_authority],
+    );
+
+    assert!(
+        !old_authority_still_controls,
+        "old authority should not control the pool after transfer"
+    );
+}
+
+#[test]
+fn test_pause_blocks_add_liquidity_and_slippage_blocks_swap() {
+    let mut f = setup_initialized_pool();
+    let payer = f.payer.insecure_clone();
+
+    add_fixture_liquidity(&mut f, 100_000_000, 100_000_000);
+
+    let swapper_token_a = create_token_account(
+        &mut f.svm,
+        &payer,
+        &f.token_a_mint.pubkey(),
+        &payer.pubkey(),
+    );
+    let swapper_token_b = create_token_account(
+        &mut f.svm,
+        &payer,
+        &f.token_b_mint.pubkey(),
+        &payer.pubkey(),
+    );
+    mint_to_account(
+        &mut f.svm,
+        &payer,
+        &f.token_a_mint.pubkey(),
+        &swapper_token_a.pubkey(),
+        1_000_000,
+    );
+
+    let swap_ok = tx_succeeds(
+        &mut f.svm,
+        &payer,
+        vec![Instruction::new_with_bytes(
+            exia_amm::id(),
+            &exia_amm::instruction::Swap {
+                amount_in: 1_000_000,
+                minimum_amount_out: u64::MAX,
+                a_to_b: true,
+            }
+            .data(),
+            exia_amm::accounts::Swap {
+                user: payer.pubkey(),
+                pool_state: f.pool_state_pda,
+                user_token_in: swapper_token_a.pubkey(),
+                user_token_out: swapper_token_b.pubkey(),
+                vault_a: f.vault_a_pda,
+                vault_b: f.vault_b_pda,
+                treasury_token_in: f.treasury_token_a.pubkey(),
+                token_program: anchor_spl::token::ID,
+            }
+            .to_account_metas(None),
+        )],
+        &[&payer],
+    );
+    assert!(!swap_ok, "swap should reject impossible slippage minimum");
+
+    send_tx(
+        &mut f.svm,
+        &payer,
+        vec![Instruction::new_with_bytes(
+            exia_amm::id(),
+            &exia_amm::instruction::SetPaused { paused: true }.data(),
+            exia_amm::accounts::SetPaused {
+                authority: payer.pubkey(),
+                pool_state: f.pool_state_pda,
+            }
+            .to_account_metas(None),
+        )],
+        &[&payer],
+    );
+
+    let paused_lp_token = create_token_account(&mut f.svm, &payer, &f.lp_mint_pda, &payer.pubkey());
+    let add_ok = tx_succeeds(
+        &mut f.svm,
+        &payer,
+        vec![Instruction::new_with_bytes(
+            exia_amm::id(),
+            &exia_amm::instruction::AddLiquidity {
+                amount_a: 1,
+                amount_b: 1,
+            }
+            .data(),
+            exia_amm::accounts::AddLiquidity {
+                user: payer.pubkey(),
+                pool_state: f.pool_state_pda,
+                user_token_a: swapper_token_a.pubkey(),
+                user_token_b: swapper_token_b.pubkey(),
+                user_lp_token: paused_lp_token.pubkey(),
+                vault_a: f.vault_a_pda,
+                vault_b: f.vault_b_pda,
+                lp_mint: f.lp_mint_pda,
+                token_program: anchor_spl::token::ID,
+                system_program: system_program::ID,
+            }
+            .to_account_metas(None),
+        )],
+        &[&payer],
+    );
+
+    assert!(!add_ok, "paused pool should reject add_liquidity");
 }
