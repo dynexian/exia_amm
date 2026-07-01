@@ -202,10 +202,25 @@ pub mod exia_amm {
             amount_out,
         )?;
 
-        // Step 4: Update invariant snapshot
+
+        // Step 4: Update TWAP accumulators
         ctx.accounts.vault_a.reload()?;
         ctx.accounts.vault_b.reload()?;
 
+        let current_ts = Clock::get()?.unix_timestamp as u64;
+        let (new_price_a_cum, new_price_b_cum, new_ts) = math::update_twap(
+            ctx.accounts.pool_state.price_a_cumulative_last,
+            ctx.accounts.pool_state.price_b_cumulative_last,
+            ctx.accounts.pool_state.block_timestamp_last,
+            ctx.accounts.vault_a.amount,
+            ctx.accounts.vault_b.amount,
+            current_ts,
+        )?;
+        ctx.accounts.pool_state.price_a_cumulative_last = new_price_a_cum;
+        ctx.accounts.pool_state.price_b_cumulative_last = new_price_b_cum;
+        ctx.accounts.pool_state.block_timestamp_last = new_ts;
+
+        // Step 5: Update invariant snapshot
         ctx.accounts.pool_state.k_last = (ctx.accounts.vault_a.amount as u128)
             .checked_mul(ctx.accounts.vault_b.amount as u128)
             .ok_or(crate::error::ErrorCode::MathOverflow)?;

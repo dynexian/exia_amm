@@ -88,3 +88,44 @@ pub fn calculate_remove_liquidity(
         .checked_div(total_lp_supply as u128).ok_or(ErrorCode::MathOverflow)? as u64;
     Ok((amount_a, amount_b))
 }
+
+/// Update cumulative prices using Q32.32 fixed-point arithmetic.
+/// Returns (new_price_a_cumulative, new_price_b_cumulative, new_timestamp)
+pub fn update_twap(
+    price_a_cumulative_last: u128,
+    price_b_cumulative_last: u128,
+    block_timestamp_last: u64,
+    reserve_a: u64,
+    reserve_b: u64,
+    current_timestamp: u64,
+) -> Result<(u128, u128, u64)> {
+    if reserve_a == 0 || reserve_b == 0 {
+        return Err(ErrorCode::NoLiquidity.into());
+    }
+
+    let elapsed = current_timestamp.saturating_sub(block_timestamp_last);
+
+    // If no time has passed (same block), don't update to avoid division issues
+    if elapsed == 0 {
+        return Ok((price_a_cumulative_last, price_b_cumulative_last, block_timestamp_last));
+    }
+
+    // Q32.32 fixed-point: shift numerator left by 32 bits before dividing
+    // price_a = reserve_b / reserve_a (how much B per unit of A)
+    let price_a_q32 = ((reserve_b as u128) << 32)
+        .checked_div(reserve_a as u128)
+        .ok_or(ErrorCode::MathOverflow)?;
+
+    // price_b = reserve_a / reserve_b (how much A per unit of B)
+    let price_b_q32 = ((reserve_a as u128) << 32)
+        .checked_div(reserve_b as u128)
+        .ok_or(ErrorCode::MathOverflow)?;
+
+    let new_price_a_cumulative = price_a_cumulative_last
+        .wrapping_add(price_a_q32.wrapping_mul(elapsed as u128));
+
+    let new_price_b_cumulative = price_b_cumulative_last
+        .wrapping_add(price_b_q32.wrapping_mul(elapsed as u128));
+
+    Ok((new_price_a_cumulative, new_price_b_cumulative, current_timestamp))
+}
