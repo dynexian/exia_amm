@@ -10,4 +10,10 @@ pub enum ErrorCode {
     SlippageExceeded,
     #[msg("Pool has no liquidity")]
     NoLiquidity,
+    #[msg("Pool is paused")]
+    PoolPaused,
+    #[msg("Unauthorized: caller is not the pool authority")]
+    Unauthorized,
+    #[msg("Fee exceeds maximum allowed (500 bps)")]
+    FeeTooHigh,
 }

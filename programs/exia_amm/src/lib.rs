@@ -21,6 +21,7 @@ pub mod exia_amm {
         lp_fee_bps: u16,
         protocol_fee_bps: u16,
         treasury_wallet: Pubkey,
+        authority: Pubkey,
     ) -> Result<()> {
         let pool_state = &mut ctx.accounts.pool_state;
 
@@ -30,6 +31,9 @@ pub mod exia_amm {
         pool_state.token_b_vault   = ctx.accounts.vault_b.key();
         pool_state.lp_mint         = ctx.accounts.lp_mint.key();
         pool_state.treasury_wallet = treasury_wallet;
+        pool_state.authority         = authority;
+        pool_state.pending_authority = Pubkey::default();
+        pool_state.is_paused         = false;
 
         pool_state.pool_bump       = ctx.bumps.pool_state;
         pool_state.authority_bump  = 0;
@@ -50,6 +54,7 @@ pub mod exia_amm {
         amount_a: u64,
         amount_b: u64,
     ) -> Result<()> {
+        require!(!ctx.accounts.pool_state.is_paused, crate::error::ErrorCode::PoolPaused);
         token::transfer(
             CpiContext::new(
                 ctx.accounts.token_program.key(),
@@ -116,6 +121,7 @@ pub mod exia_amm {
         minimum_amount_out: u64,
         a_to_b: bool,
     ) -> Result<()> {
+        require!(!ctx.accounts.pool_state.is_paused, crate::error::ErrorCode::PoolPaused);
         let pool_state = &ctx.accounts.pool_state;
 
         // Load reserves based on direction
@@ -300,5 +306,47 @@ pub mod exia_amm {
         Ok(())
     }
 
+
+    pub fn update_fees(
+        ctx: Context<UpdateFees>,
+        new_lp_fee_bps: u16,
+        new_protocol_fee_bps: u16,
+    ) -> Result<()> {
+        require!(new_lp_fee_bps <= 500, crate::error::ErrorCode::FeeTooHigh);
+        require!(new_protocol_fee_bps <= 500, crate::error::ErrorCode::FeeTooHigh);
+        let pool_state = &mut ctx.accounts.pool_state;
+        pool_state.lp_fee_bps = new_lp_fee_bps;
+        pool_state.protocol_fee_bps = new_protocol_fee_bps;
+        Ok(())
+    }
+
+    pub fn set_paused(ctx: Context<SetPaused>, paused: bool) -> Result<()> {
+        ctx.accounts.pool_state.is_paused = paused;
+        Ok(())
+    }
+
+    pub fn rotate_treasury(ctx: Context<RotateTreasury>) -> Result<()> {
+        ctx.accounts.pool_state.treasury_wallet = ctx.accounts.new_treasury.key();
+        Ok(())
+    }
+
+    pub fn propose_authority(
+        ctx: Context<ProposeAuthority>,
+        new_authority: Pubkey,
+    ) -> Result<()> {
+        ctx.accounts.pool_state.pending_authority = new_authority;
+        Ok(())
+    }
+
+    pub fn accept_authority(ctx: Context<AcceptAuthority>) -> Result<()> {
+        let pool_state = &mut ctx.accounts.pool_state;
+        require!(
+            pool_state.pending_authority == ctx.accounts.new_authority.key(),
+            crate::error::ErrorCode::Unauthorized
+        );
+        pool_state.authority = ctx.accounts.new_authority.key();
+        pool_state.pending_authority = Pubkey::default();
+        Ok(())
+    }
 }
 // append-sentinel — remove this line, paste block inside #[program] mod manually

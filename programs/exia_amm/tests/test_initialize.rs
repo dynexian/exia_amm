@@ -66,7 +66,12 @@ fn setup_initialized_pool() -> PoolFixture {
     send_tx(&mut svm, &payer, vec![
         Instruction::new_with_bytes(
             program_id,
-            &exia_amm::instruction::InitializePool { lp_fee_bps: 25, protocol_fee_bps: 5, treasury_wallet: payer.pubkey() }.data(),
+            &exia_amm::instruction::InitializePool {
+                lp_fee_bps: 25,
+                protocol_fee_bps: 5,
+                treasury_wallet: payer.pubkey(),
+                authority: payer.pubkey(),
+            }.data(),
             exia_amm::accounts::InitializePool {
                 payer: payer.pubkey(),
                 pool_state: pool_state_pda,
@@ -100,6 +105,7 @@ fn test_initialize_pool() {
     assert_eq!(pool_state.lp_mint, f.lp_mint_pda);
     assert_eq!(pool_state.lp_fee_bps, 25);
     assert_eq!(pool_state.protocol_fee_bps, 5);
+    assert_eq!(pool_state.authority, f.payer.pubkey());
     assert_eq!(pool_state.k_last, 0);
 
     println!("SUCCESS! Pool initialized at: {:?}", f.pool_state_pda);
@@ -235,6 +241,7 @@ fn test_swap_a_to_b() {
                 lp_fee_bps: 25,
                 protocol_fee_bps: 5,
                 treasury_wallet: treasury.pubkey(),
+                authority: payer2.pubkey(),
             }.data(),
             exia_amm::accounts::InitializePool {
                 payer: payer2.pubkey(),
@@ -505,6 +512,7 @@ fn test_twap_accumulates_after_swap() {
                 lp_fee_bps: 25,
                 protocol_fee_bps: 5,
                 treasury_wallet: treasury.pubkey(),
+                authority: payer2.pubkey(),
             }.data(),
             exia_amm::accounts::InitializePool {
                 payer: payer2.pubkey(),

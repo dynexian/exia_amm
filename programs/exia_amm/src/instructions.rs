@@ -152,3 +152,70 @@ pub struct RemoveLiquidity<'info> {
 
     pub token_program: Program<'info, Token>,
 }
+
+#[derive(Accounts)]
+pub struct UpdateFees<'info> {
+    pub authority: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [b"pool", pool_state.token_a_mint.as_ref(), pool_state.token_b_mint.as_ref()],
+        bump = pool_state.pool_bump,
+        has_one = authority @ crate::error::ErrorCode::Unauthorized,
+    )]
+    pub pool_state: Box<Account<'info, PoolState>>,
+}
+
+#[derive(Accounts)]
+pub struct SetPaused<'info> {
+    pub authority: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [b"pool", pool_state.token_a_mint.as_ref(), pool_state.token_b_mint.as_ref()],
+        bump = pool_state.pool_bump,
+        has_one = authority @ crate::error::ErrorCode::Unauthorized,
+    )]
+    pub pool_state: Box<Account<'info, PoolState>>,
+}
+
+#[derive(Accounts)]
+pub struct RotateTreasury<'info> {
+    pub authority: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [b"pool", pool_state.token_a_mint.as_ref(), pool_state.token_b_mint.as_ref()],
+        bump = pool_state.pool_bump,
+        has_one = authority @ crate::error::ErrorCode::Unauthorized,
+    )]
+    pub pool_state: Box<Account<'info, PoolState>>,
+
+    /// CHECK: New treasury wallet — validated by caller, stored as pubkey only.
+    pub new_treasury: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
+pub struct ProposeAuthority<'info> {
+    pub authority: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [b"pool", pool_state.token_a_mint.as_ref(), pool_state.token_b_mint.as_ref()],
+        bump = pool_state.pool_bump,
+        has_one = authority @ crate::error::ErrorCode::Unauthorized,
+    )]
+    pub pool_state: Box<Account<'info, PoolState>>,
+}
+
+#[derive(Accounts)]
+pub struct AcceptAuthority<'info> {
+    pub new_authority: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [b"pool", pool_state.token_a_mint.as_ref(), pool_state.token_b_mint.as_ref()],
+        bump = pool_state.pool_bump,
+    )]
+    pub pool_state: Box<Account<'info, PoolState>>,
+}
