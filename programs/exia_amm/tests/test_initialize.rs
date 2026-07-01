@@ -355,3 +355,110 @@ fn test_swap_a_to_b() {
     println!("  Protocol fee collected: {}", treasury_state.amount);
     println!("  k_last after swap: {}", pool_state.k_last);
 }
+
+#[test]
+fn test_remove_liquidity() {
+    let mut f = setup_initialized_pool();
+    let program_id = exia_amm::id();
+
+    let token_account_space = anchor_spl::token::TokenAccount::LEN as u64;
+    let token_account_rent = Rent::default().minimum_balance(token_account_space as usize);
+
+    let user_token_a = Keypair::new();
+    let user_token_b = Keypair::new();
+    let user_lp_token = Keypair::new();
+
+    // Create user token accounts
+    send_tx(&mut f.svm, &f.payer, vec![
+        system_instruction::create_account(&f.payer.pubkey(), &user_token_a.pubkey(), token_account_rent, token_account_space, &anchor_spl::token::ID),
+        anchor_spl::token::spl_token::instruction::initialize_account(&anchor_spl::token::ID, &user_token_a.pubkey(), &f.token_a_mint.pubkey(), &f.payer.pubkey()).unwrap(),
+        system_instruction::create_account(&f.payer.pubkey(), &user_token_b.pubkey(), token_account_rent, token_account_space, &anchor_spl::token::ID),
+        anchor_spl::token::spl_token::instruction::initialize_account(&anchor_spl::token::ID, &user_token_b.pubkey(), &f.token_b_mint.pubkey(), &f.payer.pubkey()).unwrap(),
+        system_instruction::create_account(&f.payer.pubkey(), &user_lp_token.pubkey(), token_account_rent, token_account_space, &anchor_spl::token::ID),
+        anchor_spl::token::spl_token::instruction::initialize_account(&anchor_spl::token::ID, &user_lp_token.pubkey(), &f.lp_mint_pda, &f.payer.pubkey()).unwrap(),
+    ], &[&f.payer.insecure_clone(), &user_token_a, &user_token_b, &user_lp_token]);
+
+    // Fund and add liquidity
+    let amount_a: u64 = 10_000_000;
+    let amount_b: u64 = 20_000_000;
+
+    send_tx(&mut f.svm, &f.payer, vec![
+        anchor_spl::token::spl_token::instruction::mint_to(&anchor_spl::token::ID, &f.token_a_mint.pubkey(), &user_token_a.pubkey(), &f.payer.pubkey(), &[], amount_a).unwrap(),
+        anchor_spl::token::spl_token::instruction::mint_to(&anchor_spl::token::ID, &f.token_b_mint.pubkey(), &user_token_b.pubkey(), &f.payer.pubkey(), &[], amount_b).unwrap(),
+    ], &[&f.payer.insecure_clone()]);
+
+    send_tx(&mut f.svm, &f.payer, vec![
+        Instruction::new_with_bytes(
+            program_id,
+            &exia_amm::instruction::AddLiquidity { amount_a, amount_b }.data(),
+            exia_amm::accounts::AddLiquidity {
+                user: f.payer.pubkey(),
+                pool_state: f.pool_state_pda,
+                user_token_a: user_token_a.pubkey(),
+                user_token_b: user_token_b.pubkey(),
+                user_lp_token: user_lp_token.pubkey(),
+                vault_a: f.vault_a_pda,
+                vault_b: f.vault_b_pda,
+                lp_mint: f.lp_mint_pda,
+                token_program: anchor_spl::token::ID,
+                system_program: system_program::ID,
+            }.to_account_metas(None),
+        )
+    ], &[&f.payer.insecure_clone()]);
+
+    // Record LP balance before removal
+    let lp_data_before = f.svm.get_account(&user_lp_token.pubkey()).unwrap().data;
+    let lp_state_before = anchor_spl::token::TokenAccount::try_deserialize(&mut lp_data_before.as_slice()).unwrap();
+    let lp_balance = lp_state_before.amount;
+    assert!(lp_balance > 0, "User should have LP tokens before removal");
+
+    // Remove half the liquidity
+    let lp_to_burn = lp_balance / 2;
+
+    let remove_ix = Instruction::new_with_bytes(
+        program_id,
+        &exia_amm::instruction::RemoveLiquidity { lp_amount: lp_to_burn }.data(),
+        exia_amm::accounts::RemoveLiquidity {
+            user: f.payer.pubkey(),
+            pool_state: f.pool_state_pda,
+            user_token_a: user_token_a.pubkey(),
+            user_token_b: user_token_b.pubkey(),
+            user_lp_token: user_lp_token.pubkey(),
+            vault_a: f.vault_a_pda,
+            vault_b: f.vault_b_pda,
+            lp_mint: f.lp_mint_pda,
+            token_program: anchor_spl::token::ID,
+        }.to_account_metas(None),
+    );
+
+    let blockhash = f.svm.latest_blockhash();
+    let msg = Message::new_with_blockhash(&[remove_ix], Some(&f.payer.pubkey()), &blockhash);
+    let tx = VersionedTransaction::try_new(VersionedMessage::Legacy(msg), &[&f.payer.insecure_clone()]).unwrap();
+    let res = f.svm.send_transaction(tx);
+    assert!(res.is_ok(), "remove_liquidity failed: {:?}", res);
+
+    // LP balance should have decreased
+    let lp_data_after = f.svm.get_account(&user_lp_token.pubkey()).unwrap().data;
+    let lp_state_after = anchor_spl::token::TokenAccount::try_deserialize(&mut lp_data_after.as_slice()).unwrap();
+    assert_eq!(lp_state_after.amount, lp_balance - lp_to_burn, "LP tokens should be burned");
+
+    // User should have received tokens back
+    let token_a_data = f.svm.get_account(&user_token_a.pubkey()).unwrap().data;
+    let token_a_state = anchor_spl::token::TokenAccount::try_deserialize(&mut token_a_data.as_slice()).unwrap();
+    assert!(token_a_state.amount > 0, "User should have received Token A back");
+
+    let token_b_data = f.svm.get_account(&user_token_b.pubkey()).unwrap().data;
+    let token_b_state = anchor_spl::token::TokenAccount::try_deserialize(&mut token_b_data.as_slice()).unwrap();
+    assert!(token_b_state.amount > 0, "User should have received Token B back");
+
+    // k_last should have decreased
+    let pool_data = f.svm.get_account(&f.pool_state_pda).unwrap().data;
+    let pool_state = exia_amm::state::PoolState::try_deserialize(&mut pool_data.as_slice()).unwrap();
+    assert!(pool_state.k_last < amount_a as u128 * amount_b as u128, "k_last should decrease after removal");
+
+    println!("SUCCESS! remove_liquidity passed.");
+    println!("  Token A returned: {}", token_a_state.amount);
+    println!("  Token B returned: {}", token_b_state.amount);
+    println!("  LP burned: {}, remaining: {}", lp_to_burn, lp_state_after.amount);
+    println!("  k_last after removal: {}", pool_state.k_last);
+}

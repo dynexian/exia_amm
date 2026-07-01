@@ -121,3 +121,34 @@ pub struct Swap<'info> {
 
     pub token_program: Program<'info, Token>,
 }
+
+#[derive(Accounts)]
+pub struct RemoveLiquidity<'info> {
+    #[account(mut)]
+    pub user: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [b"pool", pool_state.token_a_mint.as_ref(), pool_state.token_b_mint.as_ref()],
+        bump = pool_state.pool_bump
+    )]
+    pub pool_state: Box<Account<'info, PoolState>>,
+
+    #[account(mut)]
+    pub user_token_a: Account<'info, TokenAccount>,
+    #[account(mut)]
+    pub user_token_b: Account<'info, TokenAccount>,
+
+    #[account(mut)]
+    pub user_lp_token: Account<'info, TokenAccount>,
+
+    #[account(mut, address = pool_state.token_a_vault)]
+    pub vault_a: Box<Account<'info, TokenAccount>>,
+    #[account(mut, address = pool_state.token_b_vault)]
+    pub vault_b: Box<Account<'info, TokenAccount>>,
+
+    #[account(mut, address = pool_state.lp_mint)]
+    pub lp_mint: Account<'info, Mint>,
+
+    pub token_program: Program<'info, Token>,
+}

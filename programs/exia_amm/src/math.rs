@@ -69,3 +69,22 @@ pub fn calculate_swap_output(
 
     Ok((amount_out as u64, protocol_fee as u64, lp_fee as u64))
 }
+
+/// Returns (amount_a_out, amount_b_out)
+pub fn calculate_remove_liquidity(
+    lp_amount: u64,
+    total_lp_supply: u64,
+    reserve_a: u64,
+    reserve_b: u64,
+) -> Result<(u64, u64)> {
+    if total_lp_supply == 0 {
+        return Err(ErrorCode::NoLiquidity.into());
+    }
+    let amount_a = (lp_amount as u128)
+        .checked_mul(reserve_a as u128).ok_or(ErrorCode::MathOverflow)?
+        .checked_div(total_lp_supply as u128).ok_or(ErrorCode::MathOverflow)? as u64;
+    let amount_b = (lp_amount as u128)
+        .checked_mul(reserve_b as u128).ok_or(ErrorCode::MathOverflow)?
+        .checked_div(total_lp_supply as u128).ok_or(ErrorCode::MathOverflow)? as u64;
+    Ok((amount_a, amount_b))
+}

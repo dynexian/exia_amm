@@ -212,4 +212,78 @@ pub mod exia_amm {
 
         Ok(())
     }
+    pub fn remove_liquidity(
+        ctx: Context<RemoveLiquidity>,
+        lp_amount: u64,
+    ) -> Result<()> {
+        let total_supply = ctx.accounts.lp_mint.supply;
+        let reserve_a = ctx.accounts.vault_a.amount;
+        let reserve_b = ctx.accounts.vault_b.amount;
+
+        let (amount_a_out, amount_b_out) = math::calculate_remove_liquidity(
+            lp_amount,
+            total_supply,
+            reserve_a,
+            reserve_b,
+        )?;
+
+        let pool_seeds = &[
+            b"pool",
+            ctx.accounts.pool_state.token_a_mint.as_ref(),
+            ctx.accounts.pool_state.token_b_mint.as_ref(),
+            &[ctx.accounts.pool_state.pool_bump],
+        ];
+
+        // Burn LP tokens first
+        token::burn(
+            CpiContext::new(
+                ctx.accounts.token_program.key(),
+                token::Burn {
+                    mint: ctx.accounts.lp_mint.to_account_info(),
+                    from: ctx.accounts.user_lp_token.to_account_info(),
+                    authority: ctx.accounts.user.to_account_info(),
+                },
+            ),
+            lp_amount,
+        )?;
+
+        // Return Token A to user
+        token::transfer(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_program.key(),
+                Transfer {
+                    from: ctx.accounts.vault_a.to_account_info(),
+                    to: ctx.accounts.user_token_a.to_account_info(),
+                    authority: ctx.accounts.pool_state.to_account_info(),
+                },
+                &[pool_seeds],
+            ),
+            amount_a_out,
+        )?;
+
+        // Return Token B to user
+        token::transfer(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_program.key(),
+                Transfer {
+                    from: ctx.accounts.vault_b.to_account_info(),
+                    to: ctx.accounts.user_token_b.to_account_info(),
+                    authority: ctx.accounts.pool_state.to_account_info(),
+                },
+                &[pool_seeds],
+            ),
+            amount_b_out,
+        )?;
+
+        // Update invariant
+        ctx.accounts.vault_a.reload()?;
+        ctx.accounts.vault_b.reload()?;
+        ctx.accounts.pool_state.k_last = (ctx.accounts.vault_a.amount as u128)
+            .checked_mul(ctx.accounts.vault_b.amount as u128)
+            .ok_or(crate::error::ErrorCode::MathOverflow)?;
+
+        Ok(())
+    }
+
 }
+// append-sentinel — remove this line, paste block inside #[program] mod manually
