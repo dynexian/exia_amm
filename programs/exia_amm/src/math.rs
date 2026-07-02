@@ -1,8 +1,13 @@
 use crate::error::ErrorCode;
 use anchor_lang::prelude::*;
 
+/// The global basis point denominator where 10,000 equals 100%.
 pub const BPS_DENOMINATOR: u128 = 10_000;
 
+/// Computes the floor integer square root of a given $u128$ number using the Babylonian method.
+/// 
+/// # Security
+/// - Operates entirely within the integer domain to guarantee zero precision loss from float rendering.
 fn integer_sqrt(value: u128) -> u128 {
     if value < 2 {
         return value;
@@ -17,6 +22,14 @@ fn integer_sqrt(value: u128) -> u128 {
     x0
 }
 
+/// Calculates the exact number of LP shares to mint for a given liquidity deposit.
+/// 
+/// # Mathematical Model
+/// - Initial Deposit: $\text{shares} = \lfloor\sqrt{\Delta x \cdot \Delta y}\rfloor$
+/// - Subsequent Deposits: $\text{shares} = \min\left(\frac{\Delta x \cdot S}{x}, \frac{\Delta y \cdot S}{y}\right)$
+/// 
+/// # Security
+/// - Enforces that deposits maintain the exact balance ratio of the existing reserves to prevent arbitrage exploitation.
 pub fn calculate_lp_shares(
     amount_a: u64,
     amount_b: u64,
@@ -59,7 +72,11 @@ pub fn calculate_lp_shares(
     }
 }
 
-/// Returns (amount_out, protocol_fee, lp_fee)
+/// Computes the swap execution output and breaks down the exact fee tracking structures.
+/// 
+/// # Siphoning Architecture
+/// - Slices the fees off the top of the input token before passing the remainder to the curve engine.
+/// - Returns `(amount_out, protocol_fee, lp_fee)`.
 pub fn calculate_swap_output(
     amount_in: u64,
     reserve_in: u64,
@@ -115,7 +132,7 @@ pub fn calculate_swap_output(
     Ok((amount_out as u64, protocol_fee as u64, lp_fee as u64))
 }
 
-/// Returns (amount_a_out, amount_b_out)
+/// Calculates the proportional pro-rata share of underling vault assets to release back to an LP.
 pub fn calculate_remove_liquidity(
     lp_amount: u64,
     total_lp_supply: u64,
@@ -144,8 +161,11 @@ pub fn calculate_remove_liquidity(
     Ok((amount_a, amount_b))
 }
 
-/// Update cumulative prices using Q32.32 fixed-point arithmetic.
-/// Returns (new_price_a_cumulative, new_price_b_cumulative, new_timestamp)
+/// Accumulates prices for the Time-Weighted Average Price (TWAP) calculation using $Q32.32$ fixed-point precision.
+/// 
+/// # Arithmetic Framework
+/// - Shifts the numerator left by 32 bits before dividing to embed fractional price values into an integer format.
+/// - Accumulations utilize wrapping addition to bypass capacity constraints safely over infinite operating timelines.
 pub fn update_twap(
     price_a_cumulative_last: u128,
     price_b_cumulative_last: u128,
@@ -160,7 +180,6 @@ pub fn update_twap(
 
     let elapsed = current_timestamp.saturating_sub(block_timestamp_last);
 
-    // If no time has passed (same block), don't update to avoid division issues
     if elapsed == 0 {
         return Ok((
             price_a_cumulative_last,
@@ -169,13 +188,10 @@ pub fn update_twap(
         ));
     }
 
-    // Q32.32 fixed-point: shift numerator left by 32 bits before dividing
-    // price_a = reserve_b / reserve_a (how much B per unit of A)
     let price_a_q32 = ((reserve_b as u128) << 32)
         .checked_div(reserve_a as u128)
         .ok_or(ErrorCode::MathOverflow)?;
 
-    // price_b = reserve_a / reserve_b (how much A per unit of B)
     let price_b_q32 = ((reserve_a as u128) << 32)
         .checked_div(reserve_b as u128)
         .ok_or(ErrorCode::MathOverflow)?;
@@ -191,4 +207,84 @@ pub fn update_twap(
         new_price_b_cumulative,
         current_timestamp,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn initial_lp_shares_use_floor_sqrt() {
+        let shares = calculate_lp_shares(10, 30, 0, 0, 0).unwrap();
+        assert_eq!(shares, 17);
+    }
+
+    #[test]
+    fn initial_lp_shares_reject_zero_amounts() {
+        let res = calculate_lp_shares(0, 30, 0, 0, 0);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn subsequent_lp_shares_use_min_ratio() {
+        let shares = calculate_lp_shares(50, 80, 100, 100, 1000).unwrap();
+        assert_eq!(shares, 500);
+    }
+
+    #[test]
+    fn subsequent_lp_shares_require_nonzero_reserves() {
+        let res = calculate_lp_shares(50, 80, 0, 100, 1000);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn swap_output_applies_fee_split_and_floor_rounding() {
+        let (amount_out, protocol_fee, lp_fee) =
+            calculate_swap_output(1000, 10_000, 10_000, 30, 20).unwrap();
+
+        assert_eq!(protocol_fee, 2);
+        assert_eq!(lp_fee, 3);
+        assert_eq!(amount_out, 904);
+    }
+
+    #[test]
+    fn swap_output_rejects_when_tradeable_becomes_zero() {
+        let res = calculate_swap_output(1, 10_000, 10_000, 5000, 5000);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn remove_liquidity_is_proportional_and_floored() {
+        let (amount_a, amount_b) = calculate_remove_liquidity(333, 1000, 1000, 2000).unwrap();
+        assert_eq!(amount_a, 333);
+        assert_eq!(amount_b, 666);
+    }
+
+    #[test]
+    fn remove_liquidity_rejects_lp_amount_over_supply() {
+        let res = calculate_remove_liquidity(1001, 1000, 1000, 1000);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn update_twap_no_elapsed_time_is_noop() {
+        let (price_a, price_b, ts) = update_twap(100, 200, 10, 50, 100, 10).unwrap();
+        assert_eq!(price_a, 100);
+        assert_eq!(price_b, 200);
+        assert_eq!(ts, 10);
+    }
+
+    #[test]
+    fn update_twap_accumulates_q32_price_over_time() {
+        let (price_a, price_b, ts) = update_twap(0, 0, 10, 200, 100, 15).unwrap();
+        assert_eq!(price_a, 10_737_418_240);
+        assert_eq!(price_b, 42_949_672_960);
+        assert_eq!(ts, 15);
+    }
+
+    #[test]
+    fn update_twap_rejects_zero_reserves() {
+        let res = update_twap(0, 0, 10, 0, 100, 20);
+        assert!(res.is_err());
+    }
 }

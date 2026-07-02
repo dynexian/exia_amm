@@ -9,6 +9,9 @@ skip-lint = false
 [programs.localnet]
 exia_amm = "2Hy7ouFwJLkG7cpAoSR4hGaFk3zPH2gAYLKjTMdGsqQs"
 
+[programs.devnet]
+exia_amm = "2Hy7ouFwJLkG7cpAoSR4hGaFk3zPH2gAYLKjTMdGsqQs"
+
 [provider]
 cluster = "localnet"
 wallet = "~/.config/solana/id.json"

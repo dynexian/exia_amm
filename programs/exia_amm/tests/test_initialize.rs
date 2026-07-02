@@ -1885,3 +1885,221 @@ fn test_pause_blocks_add_liquidity_and_slippage_blocks_swap() {
 
     assert!(!add_ok, "paused pool should reject add_liquidity");
 }
+
+#[test]
+fn test_reinitialize_same_pool_fails() {
+    let mut f = setup_initialized_pool();
+    let payer = f.payer.insecure_clone();
+
+    let ok = tx_succeeds(
+        &mut f.svm,
+        &payer,
+        vec![Instruction::new_with_bytes(
+            exia_amm::id(),
+            &exia_amm::instruction::InitializePool {
+                lp_fee_bps: 25,
+                protocol_fee_bps: 5,
+                authority: payer.pubkey(),
+            }
+            .data(),
+            exia_amm::accounts::InitializePool {
+                payer: payer.pubkey(),
+                pool_state: f.pool_state_pda,
+                token_a_mint: f.token_a_mint.pubkey(),
+                token_b_mint: f.token_b_mint.pubkey(),
+                treasury_token_a: f.treasury_token_a.pubkey(),
+                treasury_token_b: f.treasury_token_b.pubkey(),
+                vault_a: f.vault_a_pda,
+                vault_b: f.vault_b_pda,
+                lp_mint: f.lp_mint_pda,
+                token_program: anchor_spl::token::ID,
+                system_program: system_program::ID,
+                rent: "SysvarRent111111111111111111111111111111111"
+                    .parse()
+                    .unwrap(),
+            }
+            .to_account_metas(None),
+        )],
+        &[&payer],
+    );
+
+    assert!(!ok, "pool reinitialization should fail");
+}
+
+#[test]
+fn test_non_authority_cannot_call_admin_instructions() {
+    let mut f = setup_initialized_pool();
+    let authority = f.payer.insecure_clone();
+    let intruder = Keypair::new();
+    f.svm.airdrop(&intruder.pubkey(), 10_000_000_000).unwrap();
+
+    let update_ok = tx_succeeds(
+        &mut f.svm,
+        &intruder,
+        vec![Instruction::new_with_bytes(
+            exia_amm::id(),
+            &exia_amm::instruction::UpdateFees {
+                new_lp_fee_bps: 30,
+                new_protocol_fee_bps: 5,
+            }
+            .data(),
+            exia_amm::accounts::UpdateFees {
+                authority: intruder.pubkey(),
+                pool_state: f.pool_state_pda,
+            }
+            .to_account_metas(None),
+        )],
+        &[&intruder],
+    );
+    assert!(!update_ok, "non-authority must not update fees");
+
+    let pause_ok = tx_succeeds(
+        &mut f.svm,
+        &intruder,
+        vec![Instruction::new_with_bytes(
+            exia_amm::id(),
+            &exia_amm::instruction::SetPaused { paused: true }.data(),
+            exia_amm::accounts::SetPaused {
+                authority: intruder.pubkey(),
+                pool_state: f.pool_state_pda,
+            }
+            .to_account_metas(None),
+        )],
+        &[&intruder],
+    );
+    assert!(!pause_ok, "non-authority must not pause pool");
+
+    let propose_ok = tx_succeeds(
+        &mut f.svm,
+        &intruder,
+        vec![Instruction::new_with_bytes(
+            exia_amm::id(),
+            &exia_amm::instruction::ProposeAuthority {
+                new_authority: intruder.pubkey(),
+            }
+            .data(),
+            exia_amm::accounts::ProposeAuthority {
+                authority: intruder.pubkey(),
+                pool_state: f.pool_state_pda,
+            }
+            .to_account_metas(None),
+        )],
+        &[&intruder],
+    );
+    assert!(!propose_ok, "non-authority must not propose authority");
+
+    let new_treasury_a = create_token_account(
+        &mut f.svm,
+        &authority,
+        &f.token_a_mint.pubkey(),
+        &authority.pubkey(),
+    );
+    let new_treasury_b = create_token_account(
+        &mut f.svm,
+        &authority,
+        &f.token_b_mint.pubkey(),
+        &authority.pubkey(),
+    );
+
+    let rotate_ok = tx_succeeds(
+        &mut f.svm,
+        &intruder,
+        vec![Instruction::new_with_bytes(
+            exia_amm::id(),
+            &exia_amm::instruction::RotateTreasury {}.data(),
+            exia_amm::accounts::RotateTreasury {
+                authority: intruder.pubkey(),
+                pool_state: f.pool_state_pda,
+                new_treasury_token_a: new_treasury_a.pubkey(),
+                new_treasury_token_b: new_treasury_b.pubkey(),
+            }
+            .to_account_metas(None),
+        )],
+        &[&intruder],
+    );
+    assert!(!rotate_ok, "non-authority must not rotate treasury");
+}
+
+#[test]
+fn test_accept_authority_without_pending_proposal_fails() {
+    let mut f = setup_initialized_pool();
+    let current_authority = f.payer.insecure_clone();
+    let new_authority = Keypair::new();
+
+    let ok = tx_succeeds(
+        &mut f.svm,
+        &current_authority,
+        vec![Instruction::new_with_bytes(
+            exia_amm::id(),
+            &exia_amm::instruction::AcceptAuthority {}.data(),
+            exia_amm::accounts::AcceptAuthority {
+                new_authority: new_authority.pubkey(),
+                pool_state: f.pool_state_pda,
+            }
+            .to_account_metas(None),
+        )],
+        &[&current_authority, &new_authority],
+    );
+
+    assert!(
+        !ok,
+        "accept_authority must fail when no pending authority is set"
+    );
+}
+
+#[test]
+fn test_swap_rejects_wrong_input_mint_for_direction() {
+    let mut f = setup_initialized_pool();
+    let payer = f.payer.insecure_clone();
+
+    add_fixture_liquidity(&mut f, 100_000_000, 100_000_000);
+
+    let swapper_token_a = create_token_account(
+        &mut f.svm,
+        &payer,
+        &f.token_a_mint.pubkey(),
+        &payer.pubkey(),
+    );
+    let swapper_token_b = create_token_account(
+        &mut f.svm,
+        &payer,
+        &f.token_b_mint.pubkey(),
+        &payer.pubkey(),
+    );
+
+    mint_to_account(
+        &mut f.svm,
+        &payer,
+        &f.token_b_mint.pubkey(),
+        &swapper_token_b.pubkey(),
+        1_000_000,
+    );
+
+    let ok = tx_succeeds(
+        &mut f.svm,
+        &payer,
+        vec![Instruction::new_with_bytes(
+            exia_amm::id(),
+            &exia_amm::instruction::Swap {
+                amount_in: 1_000_000,
+                minimum_amount_out: 1,
+                a_to_b: true,
+            }
+            .data(),
+            exia_amm::accounts::Swap {
+                user: payer.pubkey(),
+                pool_state: f.pool_state_pda,
+                user_token_in: swapper_token_b.pubkey(),
+                user_token_out: swapper_token_a.pubkey(),
+                vault_a: f.vault_a_pda,
+                vault_b: f.vault_b_pda,
+                treasury_token_in: f.treasury_token_a.pubkey(),
+                token_program: anchor_spl::token::ID,
+            }
+            .to_account_metas(None),
+        )],
+        &[&payer],
+    );
+
+    assert!(!ok, "A->B swap must reject non-Token-A input account");
+}

@@ -1,7 +1,6 @@
 use anchor_lang::prelude::*;
 use anchor_spl::token::{self, MintTo, Transfer};
 
-pub mod constants;
 pub mod error;
 pub mod instructions;
 pub mod math;
@@ -12,10 +11,13 @@ use instructions::*;
 
 declare_id!("2Hy7ouFwJLkG7cpAoSR4hGaFk3zPH2gAYLKjTMdGsqQs");
 
+/// Retrieves the current on-chain Unix timestamp.
 fn current_timestamp() -> Result<u64> {
     Ok(Clock::get()?.unix_timestamp.max(0) as u64)
 }
 
+/// Synchronizes the Time-Weighted Average Price (TWAP) oracle.
+/// Must be called *before* any state mutation (swaps or liquidity changes) occurs in the current transaction.
 fn sync_twap(
     pool_state: &mut state::PoolState,
     reserve_a: u64,
@@ -45,6 +47,11 @@ fn sync_twap(
 pub mod exia_amm {
     use super::*;
 
+    /// Initializes a new constant product liquidity pool.
+    ///
+    /// # Security
+    /// - Forges sovereign PDAs for Vault A, Vault B, and the LP Mint.
+    /// - Validates that requested fee configurations do not exceed protocol maximums (500 bps).
     pub fn initialize_pool(
         ctx: Context<InitializePool>,
         lp_fee_bps: u16,
@@ -81,6 +88,11 @@ pub mod exia_amm {
         Ok(())
     }
 
+    /// Deposits Token A and Token B into the pool in exchange for LP shares.
+    ///
+    /// # Security
+    /// - Reverts if the pool is globally paused.
+    /// - LP shares are strictly calculated against pre-deposit reserves to prevent dilution attacks.
     pub fn add_liquidity(ctx: Context<AddLiquidity>, amount_a: u64, amount_b: u64) -> Result<()> {
         require!(
             !ctx.accounts.pool_state.is_paused,
@@ -90,6 +102,7 @@ pub mod exia_amm {
         let reserve_b_before = ctx.accounts.vault_b.amount;
         let total_lp_supply = ctx.accounts.lp_mint.supply;
         let current_ts = current_timestamp()?;
+        
         sync_twap(
             &mut ctx.accounts.pool_state,
             reserve_a_before,
@@ -157,6 +170,17 @@ pub mod exia_amm {
         Ok(())
     }
 
+    /// Executes a trade against the constant product curve.
+    ///
+    /// # Arguments
+    /// * `amount_in` - The exact amount of input tokens the user is providing.
+    /// * `minimum_amount_out` - The cryptographic slippage shield. Transaction reverts if output is lower.
+    /// * `a_to_b` - Direction flag. True if swapping Token A for Token B; False otherwise.
+    ///
+    /// # Security
+    /// - Reverts if pool is paused.
+    /// - Treasury and user token account mints are cryptographically validated against swap direction.
+    /// - TWAP is synced prior to reserve mutation, negating intra-block oracle manipulation.
     pub fn swap(
         ctx: Context<Swap>,
         amount_in: u64,
@@ -170,7 +194,6 @@ pub mod exia_amm {
         let reserve_a_before = ctx.accounts.vault_a.amount;
         let reserve_b_before = ctx.accounts.vault_b.amount;
 
-        // Load reserves based on direction
         let (reserve_in, reserve_out) = if a_to_b {
             (reserve_a_before, reserve_b_before)
         } else {
@@ -212,7 +235,6 @@ pub mod exia_amm {
             ErrorCode::InvalidTreasury
         );
 
-        // Step 1: Calculate output and fee amounts
         let (amount_out, protocol_fee, _lp_fee) = math::calculate_swap_output(
             amount_in,
             reserve_in,
@@ -221,7 +243,6 @@ pub mod exia_amm {
             ctx.accounts.pool_state.protocol_fee_bps,
         )?;
 
-        // Step 2: Slippage check
         require!(
             amount_out >= minimum_amount_out,
             ErrorCode::SlippageExceeded
@@ -242,7 +263,6 @@ pub mod exia_amm {
             &[ctx.accounts.pool_state.pool_bump],
         ];
 
-        // Step 3a: Transfer full amount_in from user → vault_in
         let (vault_in, vault_out) = if a_to_b {
             (
                 ctx.accounts.vault_a.to_account_info(),
@@ -267,8 +287,6 @@ pub mod exia_amm {
             amount_in,
         )?;
 
-        // Step 3b: Transfer protocol_fee from vault_in → treasury
-        // (pool_state PDA signs since it owns the vault)
         token::transfer(
             CpiContext::new_with_signer(
                 ctx.accounts.token_program.key(),
@@ -286,7 +304,6 @@ pub mod exia_amm {
             protocol_fee,
         )?;
 
-        // Step 3c: Transfer amount_out from vault_out → user
         token::transfer(
             CpiContext::new_with_signer(
                 ctx.accounts.token_program.key(),
@@ -300,17 +317,17 @@ pub mod exia_amm {
             amount_out,
         )?;
 
-        // Step 4: Reload reserves after the swap
         ctx.accounts.vault_a.reload()?;
         ctx.accounts.vault_b.reload()?;
 
-        // Step 5: Update invariant snapshot
         ctx.accounts.pool_state.k_last = (ctx.accounts.vault_a.amount as u128)
             .checked_mul(ctx.accounts.vault_b.amount as u128)
             .ok_or(crate::error::ErrorCode::MathOverflow)?;
 
         Ok(())
     }
+    
+    /// Burns LP tokens to reclaim an equivalent pro-rata share of Token A and Token B reserves.
     pub fn remove_liquidity(ctx: Context<RemoveLiquidity>, lp_amount: u64) -> Result<()> {
         let total_supply = ctx.accounts.lp_mint.supply;
         let reserve_a = ctx.accounts.vault_a.amount;
@@ -333,7 +350,6 @@ pub mod exia_amm {
             &[ctx.accounts.pool_state.pool_bump],
         ];
 
-        // Burn LP tokens first
         token::burn(
             CpiContext::new(
                 ctx.accounts.token_program.key(),
@@ -346,7 +362,6 @@ pub mod exia_amm {
             lp_amount,
         )?;
 
-        // Return Token A to user
         token::transfer(
             CpiContext::new_with_signer(
                 ctx.accounts.token_program.key(),
@@ -360,7 +375,6 @@ pub mod exia_amm {
             amount_a_out,
         )?;
 
-        // Return Token B to user
         token::transfer(
             CpiContext::new_with_signer(
                 ctx.accounts.token_program.key(),
@@ -374,7 +388,6 @@ pub mod exia_amm {
             amount_b_out,
         )?;
 
-        // Update invariant
         ctx.accounts.vault_a.reload()?;
         ctx.accounts.vault_b.reload()?;
         ctx.accounts.pool_state.k_last = (ctx.accounts.vault_a.amount as u128)
@@ -384,6 +397,7 @@ pub mod exia_amm {
         Ok(())
     }
 
+    /// Admin Instruction: Updates pool fee structures (Requires current authority signature).
     pub fn update_fees(
         ctx: Context<UpdateFees>,
         new_lp_fee_bps: u16,
@@ -400,22 +414,26 @@ pub mod exia_amm {
         Ok(())
     }
 
+    /// Admin Instruction: Toggles the emergency pool lock (Requires current authority signature).
     pub fn set_paused(ctx: Context<SetPaused>, paused: bool) -> Result<()> {
         ctx.accounts.pool_state.is_paused = paused;
         Ok(())
     }
 
+    /// Admin Instruction: Updates external destination accounts for protocol revenue (Requires current authority signature).
     pub fn rotate_treasury(ctx: Context<RotateTreasury>) -> Result<()> {
         ctx.accounts.pool_state.treasury_token_a = ctx.accounts.new_treasury_token_a.key();
         ctx.accounts.pool_state.treasury_token_b = ctx.accounts.new_treasury_token_b.key();
         Ok(())
     }
 
+    /// Admin Instruction: Step 1 of Authority handoff. Nominates a new administrative wallet.
     pub fn propose_authority(ctx: Context<ProposeAuthority>, new_authority: Pubkey) -> Result<()> {
         ctx.accounts.pool_state.pending_authority = new_authority;
         Ok(())
     }
 
+    /// Admin Instruction: Step 2 of Authority handoff. Nominated wallet accepts, completing the transfer.
     pub fn accept_authority(ctx: Context<AcceptAuthority>) -> Result<()> {
         let pool_state = &mut ctx.accounts.pool_state;
         require!(
