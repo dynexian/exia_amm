@@ -9,7 +9,7 @@ import {
   type Signer,
 } from "@solana/web3.js";
 import { TOKEN_PROGRAM_ID } from "@solana/spl-token";
-import idlJson from "../../target/idl/exia_amm.json" with { type: "json" };
+import idlJson from "../../target/idl/exia_amm.json";
 
 export const EXIA_AMM_PROGRAM_ID = new PublicKey(idlJson.address);
 

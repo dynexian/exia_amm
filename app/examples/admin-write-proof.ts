@@ -4,16 +4,28 @@ import { ExiaAmmClient, keypairFromFile } from "../src/index.js";
 
 const REQUIRED_CONFIRMATION = "YES_I_KNOW_THIS_SENDS_A_TX";
 
+function readPublicKeyEnv(name: string): PublicKey {
+  const value = process.env[name];
+
+  if (!value) {
+    throw new Error(`Set ${name} to a base58 public key.`);
+  }
+
+  if (value.includes("your_") || value.includes("<") || value.includes(">")) {
+    throw new Error(`Set ${name} to a real base58 public key, not a placeholder.`);
+  }
+
+  try {
+    return new PublicKey(value);
+  } catch {
+    throw new Error(`Set ${name} to a valid base58 public key.`);
+  }
+}
+
 async function main() {
   const rpcUrl = process.env.RPC_URL ?? "http://127.0.0.1:8899";
   const walletPath = process.env.WALLET_PATH ?? `${process.env.HOME}/.config/solana/id.json`;
-  const tokenAMintRaw = process.env.TOKEN_A_MINT;
-  const tokenBMintRaw = process.env.TOKEN_B_MINT;
   const confirmation = process.env.WRITE_DEMO_CONFIRM;
-
-  if (!tokenAMintRaw || !tokenBMintRaw) {
-    throw new Error("Set TOKEN_A_MINT and TOKEN_B_MINT environment variables.");
-  }
 
   if (confirmation !== REQUIRED_CONFIRMATION) {
     throw new Error(
@@ -21,8 +33,8 @@ async function main() {
     );
   }
 
-  const tokenAMint = new PublicKey(tokenAMintRaw);
-  const tokenBMint = new PublicKey(tokenBMintRaw);
+  const tokenAMint = readPublicKeyEnv("TOKEN_A_MINT");
+  const tokenBMint = readPublicKeyEnv("TOKEN_B_MINT");
 
   const signer = await keypairFromFile(walletPath);
   const wallet = new Wallet(signer);
