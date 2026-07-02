@@ -8,7 +8,11 @@
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "example": "tsx examples/demo.ts",
-    "example:write": "tsx examples/admin-write-proof.ts"
+    "example:write": "tsx examples/admin-write-proof.ts",
+    "add-liquidity": "tsx examples/add_liquidity.ts",
+    "swap": "tsx examples/swap.ts",
+    "rotate-treasury": "tsx examples/rotate_treasury.ts",
+    "remove-liquidity": "tsx examples/remove_liquidity.ts"
   },
   "dependencies": {
     "@coral-xyz/anchor": "^0.31.1",
