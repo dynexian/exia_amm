@@ -19,50 +19,73 @@ Canonical addresses:
 
 ```mermaid
 flowchart TD
-    User[User Signer]
-    Admin[Authority Signer]
-    TA[Token A Mint]
-    TB[Token B Mint]
+    classDef signer fill:#888780,stroke:#2C2C2A,color:#fff,font-weight:bold
+    classDef mint fill:#7F77DD,stroke:#26215C,color:#fff
+    classDef pda fill:#1D9E75,stroke:#04342C,color:#fff
+    classDef user fill:#378ADD,stroke:#042C53,color:#fff
+    classDef treasury fill:#D85A30,stroke:#4A1B0C,color:#fff
 
-    PS[PoolState PDA]
-    VA[Vault A PDA TokenAccount]
-    VB[Vault B PDA TokenAccount]
-    LP[LP Mint PDA]
+    User["👤 User Signer"]:::signer
+    Admin["🔑 Authority Signer"]:::signer
 
-    UTA[User Token A]
-    UTB[User Token B]
-    ULP[User LP Token]
+    subgraph Mints [" Token Mints "]
+        TA["Token A Mint"]:::mint
+        TB["Token B Mint"]:::mint
+    end
 
-    TRA[Treasury Token A]
-    TRB[Treasury Token B]
+    subgraph Pool [" Pool — Program-Owned PDAs "]
+        PS["PoolState"]:::pda
+        VA["Vault A"]:::pda
+        VB["Vault B"]:::pda
+        LP["LP Mint"]:::pda
+    end
 
+    subgraph UserAccts [" User Token Accounts "]
+        UTA["User Token A"]:::user
+        UTB["User Token B"]:::user
+        ULP["User LP Token"]:::user
+    end
+
+    subgraph Treasury [" Protocol Treasury "]
+        TRA["Treasury Token A"]:::treasury
+        TRB["Treasury Token B"]:::treasury
+    end
+
+    %% Ownership / mint links
     TA --> VA
     TB --> VB
-    PS --> VA
-    PS --> VB
-    PS --> LP
+    PS -.-> VA
+    PS -.-> VB
+    PS -.-> LP
+    User -.-> UTA
+    User -.-> UTB
+    User -.-> ULP
 
-    User --> UTA
-    User --> UTB
-    User --> ULP
-
+    %% Liquidity
     UTA -->|add_liquidity| VA
     UTB -->|add_liquidity| VB
     LP -->|mint_to| ULP
-
-    UTA -->|swap A->B in| VA
-    VB -->|swap A->B out| UTB
-    VA -->|protocol fee A| TRA
-
-    UTB -->|swap B->A in| VB
-    VA -->|swap B->A out| UTA
-    VB -->|protocol fee B| TRB
-
-    ULP -->|burn| LP
     VA -->|remove_liquidity| UTA
     VB -->|remove_liquidity| UTB
+    ULP -->|burn| LP
 
-    Admin -->|update_fees/set_paused/rotate_treasury/propose_authority| PS
+    %% Swaps
+    UTA -->|"swap A→B (in)"| VA
+    VB -->|"swap A→B (out)"| UTB
+    UTB -->|"swap B→A (in)"| VB
+    VA -->|"swap B→A (out)"| UTA
+
+    %% Fees
+    VA -->|protocol fee| TRA
+    VB -->|protocol fee| TRB
+
+    %% Admin
+    Admin -.->|"update_fees / set_paused /<br/>rotate_treasury / propose_authority"| PS
+
+    linkStyle 2,3,4,5,6,7 stroke:#888780,stroke-dasharray: 4 3
+    linkStyle 20 stroke:#D85A30,stroke-width:1px
+    linkStyle 21 stroke:#D85A30,stroke-width:1px
+    linkStyle 22 stroke:#534AB7,stroke-dasharray: 4 3,stroke-width:1.5px
 ```
 
 ## 3. PoolState Layout
