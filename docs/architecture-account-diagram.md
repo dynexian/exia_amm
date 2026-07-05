@@ -18,74 +18,86 @@ Canonical addresses:
 ## 2. Account Relationship Diagram
 
 ```mermaid
+---
+config:
+  layout: elk
+---
+
 flowchart TD
-    classDef signer fill:#888780,stroke:#2C2C2A,color:#fff,font-weight:bold
-    classDef mint fill:#7F77DD,stroke:#26215C,color:#fff
-    classDef pda fill:#1D9E75,stroke:#04342C,color:#fff
-    classDef user fill:#378ADD,stroke:#042C53,color:#fff
-    classDef treasury fill:#D85A30,stroke:#4A1B0C,color:#fff
+    %% === Class Definitions ===
+    classDef signer fill:#eef2ff,stroke:#818cf8,color:#1e1b4b,font-weight:bold
+    classDef mint fill:#f0fdfa,stroke:#2dd4bf,color:#064e3b
+    classDef pda fill:#f5f3ff,stroke:#a78bfa,color:#4c1d95
+    classDef user fill:#ecfeff,stroke:#22d3ee,color:#083344
+    classDef treasury fill:#fff1f2,stroke:#fb7185,color:#7f1d1d
 
-    User["User Signer"]:::signer
-    Admin["Authority Signer"]:::signer
+    %% === Actors ===
+    User[User Signer]:::signer
+    Admin[Authority Signer]:::signer
 
-    subgraph Mints [" Token Mints "]
-        TA["Token A Mint"]:::mint
-        TB["Token B Mint"]:::mint
+    %% === Token Mints ===
+    subgraph Mints[Token Mints]
+        direction TB
+        TA[Token A Mint]:::mint
+        TB[Token B Mint]:::mint
     end
 
-    subgraph Pool [" Pool — Program-Owned PDAs "]
-        PS["PoolState"]:::pda
-        VA["Vault A"]:::pda
-        VB["Vault B"]:::pda
-        LP["LP Mint"]:::pda
+    %% === Pool (Program Owned PDAs) ===
+    subgraph Pool["Pool (Program-Owned PDAs)"]
+        direction TB
+        PS[Pool State]:::pda
+        VA[Vault A]:::pda
+        VB[Vault B]:::pda
+        LP[LP Mint]:::pda
     end
 
-    subgraph UserAccts [" User Token Accounts "]
-        UTA["User Token A"]:::user
-        UTB["User Token B"]:::user
-        ULP["User LP Token"]:::user
+    %% === User Token Accounts ===
+    subgraph UserAccts[User Token Accounts]
+        direction TB
+        UTA[User Token A]:::user
+        UTB[User Token B]:::user
+        ULP[User LP Token]:::user
     end
 
-    subgraph Treasury [" Protocol Treasury "]
-        TRA["Treasury Token A"]:::treasury
-        TRB["Treasury Token B"]:::treasury
+    %% === Treasury ===
+    subgraph Treasury[Protocol Treasury]
+        direction TB
+        TRA[Treasury Token A]:::treasury
+        TRB[Treasury Token B]:::treasury
     end
 
-    %% Ownership / mint links
+    %% === Mint to Vault Connections ===
     TA --> VA
     TB --> VB
+
+    %% === Pool Control Links ===
     PS -.-> VA
     PS -.-> VB
     PS -.-> LP
+
+    %% === User ↔ Accounts ===
     User -.-> UTA
     User -.-> UTB
     User -.-> ULP
 
-    %% Liquidity
+    %% === Liquidity Actions ===
     UTA -->|add_liquidity| VA
     UTB -->|add_liquidity| VB
     LP -->|mint_to| ULP
+
     VA -->|remove_liquidity| UTA
     VB -->|remove_liquidity| UTB
     ULP -->|burn| LP
 
-    %% Swaps
-    UTA -->|"swap A→B (in)"| VA
-    VB -->|"swap A→B (out)"| UTB
-    UTB -->|"swap B→A (in)"| VB
-    VA -->|"swap B→A (out)"| UTA
+    %% === Swap Routes ===
+    UTA -->|"swap A → B in"| VA
+    VB -->|"swap A → B out"| UTB
+    UTB -->|"swap B → A in"| VB
+    VA -->|"swap B → A out"| UTA
 
-    %% Fees
+    %% === Protocol Fees ===
     VA -->|protocol fee| TRA
     VB -->|protocol fee| TRB
-
-    %% Admin
-    Admin -.->|"update_fees / set_paused /<br/>rotate_treasury / propose_authority"| PS
-
-    linkStyle 2,3,4,5,6,7 stroke:#888780,stroke-dasharray: 4 3
-    linkStyle 20 stroke:#D85A30,stroke-width:1px
-    linkStyle 21 stroke:#D85A30,stroke-width:1px
-    linkStyle 22 stroke:#534AB7,stroke-dasharray: 4 3,stroke-width:1.5px
 ```
 
 ## 3. PoolState Layout
