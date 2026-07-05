@@ -25,8 +25,8 @@ flowchart TD
     classDef user fill:#378ADD,stroke:#042C53,color:#fff
     classDef treasury fill:#D85A30,stroke:#4A1B0C,color:#fff
 
-    User["👤 User Signer"]:::signer
-    Admin["🔑 Authority Signer"]:::signer
+    User["User Signer"]:::signer
+    Admin["Authority Signer"]:::signer
 
     subgraph Mints [" Token Mints "]
         TA["Token A Mint"]:::mint
