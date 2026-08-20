@@ -22,82 +22,101 @@ Canonical addresses:
 config:
   layout: elk
 ---
-
 flowchart TD
-    %% === Class Definitions ===
+    %% ─────────────────────────────────────────
+    %% Styles
+    %% ─────────────────────────────────────────
     classDef signer fill:#eef2ff,stroke:#818cf8,color:#1e1b4b,font-weight:bold
     classDef mint fill:#f0fdfa,stroke:#2dd4bf,color:#064e3b
     classDef pda fill:#f5f3ff,stroke:#a78bfa,color:#4c1d95
     classDef user fill:#ecfeff,stroke:#22d3ee,color:#083344
     classDef treasury fill:#fff1f2,stroke:#fb7185,color:#7f1d1d
 
-    %% === Actors ===
-    User[User Signer]:::signer
-    Admin[Authority Signer]:::signer
+    %% ─────────────────────────────────────────
+    %% Signers
+    %% ─────────────────────────────────────────
+    User["User Signer"]:::signer
+    Admin["Authority Signer"]:::signer
 
-    %% === Token Mints ===
-    subgraph Mints[Token Mints]
-        direction TB
-        TA[Token A Mint]:::mint
-        TB[Token B Mint]:::mint
+    %% ─────────────────────────────────────────
+    %% Token Mints
+    %% ─────────────────────────────────────────
+    subgraph Mints["Token Mints"]
+        direction LR
+        TA["Token A Mint"]:::mint
+        TB["Token B Mint"]:::mint
     end
 
-    %% === Pool (Program Owned PDAs) ===
-    subgraph Pool["Pool (Program-Owned PDAs)"]
+    %% ─────────────────────────────────────────
+    %% Pool Accounts
+    %% ─────────────────────────────────────────
+    subgraph Pool["Pool · Program-Owned PDAs"]
         direction TB
-        PS[Pool State]:::pda
-        VA[Vault A]:::pda
-        VB[Vault B]:::pda
-        LP[LP Mint]:::pda
+        PS["Pool State"]:::pda
+        VA["Vault A"]:::pda
+        VB["Vault B"]:::pda
+        LP["LP Mint"]:::pda
     end
 
-    %% === User Token Accounts ===
-    subgraph UserAccts[User Token Accounts]
+    %% ─────────────────────────────────────────
+    %% User Token Accounts
+    %% ─────────────────────────────────────────
+    subgraph UserAccts["User Token Accounts"]
         direction TB
-        UTA[User Token A]:::user
-        UTB[User Token B]:::user
-        ULP[User LP Token]:::user
+        UTA["User Token A"]:::user
+        UTB["User Token B"]:::user
+        ULP["User LP Token"]:::user
     end
 
-    %% === Treasury ===
-    subgraph Treasury[Protocol Treasury]
+    %% ─────────────────────────────────────────
+    %% Protocol Treasury
+    %% ─────────────────────────────────────────
+    subgraph Treasury["Protocol Treasury"]
         direction TB
-        TRA[Treasury Token A]:::treasury
-        TRB[Treasury Token B]:::treasury
+        TRA["Treasury Token A"]:::treasury
+        TRB["Treasury Token B"]:::treasury
     end
 
-    %% === Mint to Vault Connections ===
-    TA --> VA
-    TB --> VB
+    %% ─────────────────────────────────────────
+    %% Authority and ownership
+    %% ─────────────────────────────────────────
+    Admin -. "authority" .-> PS
+    TA -->|"underlying asset"| VA
+    TB -->|"underlying asset"| VB
 
-    %% === Pool Control Links ===
-    PS -.-> VA
-    PS -.-> VB
-    PS -.-> LP
+    PS -. "controls" .-> VA
+    PS -. "controls" .-> VB
+    PS -. "controls" .-> LP
 
-    %% === User ↔ Accounts ===
-    User -.-> UTA
-    User -.-> UTB
-    User -.-> ULP
+    User -. "owns" .-> UTA
+    User -. "owns" .-> UTB
+    User -. "owns" .-> ULP
 
-    %% === Liquidity Actions ===
-    UTA -->|add_liquidity| VA
-    UTB -->|add_liquidity| VB
-    LP -->|mint_to| ULP
+    %% ─────────────────────────────────────────
+    %% Liquidity flows
+    %% ─────────────────────────────────────────
+    UTA -->|"add liquidity · Token A"| VA
+    UTB -->|"add liquidity · Token B"| VB
+    LP -->|"mint LP tokens"| ULP
 
-    VA -->|remove_liquidity| UTA
-    VB -->|remove_liquidity| UTB
-    ULP -->|burn| LP
+    VA -->|"remove liquidity · Token A"| UTA
+    VB -->|"remove liquidity · Token B"| UTB
+    ULP -->|"burn LP tokens"| LP
 
-    %% === Swap Routes ===
-    UTA -->|"swap A → B in"| VA
-    VB -->|"swap A → B out"| UTB
-    UTB -->|"swap B → A in"| VB
-    VA -->|"swap B → A out"| UTA
+    %% ─────────────────────────────────────────
+    %% Swap flows
+    %% ─────────────────────────────────────────
+    UTA -->|"swap A → B · input"| VA
+    VB -->|"swap A → B · output"| UTB
 
-    %% === Protocol Fees ===
-    VA -->|protocol fee| TRA
-    VB -->|protocol fee| TRB
+    UTB -->|"swap B → A · input"| VB
+    VA -->|"swap B → A · output"| UTA
+
+    %% ─────────────────────────────────────────
+    %% Fee flows
+    %% ─────────────────────────────────────────
+    VA -->|"protocol fee · Token A"| TRA
+    VB -->|"protocol fee · Token B"| TRB
 ```
 
 ## 3. PoolState Layout
